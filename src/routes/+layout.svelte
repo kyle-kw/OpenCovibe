@@ -1183,6 +1183,10 @@
     if (e.button !== 0) return;
     const target = e.target as HTMLElement | null;
     if (target?.closest("button, a, input, textarea, select, [data-no-window-drag]")) return;
+    if (e.detail === 2) {
+      await toggleMaximizeWindow();
+      return;
+    }
     try {
       const appWindow = await getTauriWindow();
       await appWindow?.startDragging();
@@ -1357,7 +1361,6 @@
   <div
     class="flex h-8 shrink-0 select-none items-center border-b border-border bg-background text-foreground"
     onpointerdown={startWindowDrag}
-    ondblclick={toggleMaximizeWindow}
   >
     <div class="flex h-full min-w-0 items-center gap-2 px-3">
       <img src="/logo.png?v=2" alt="OpenCovibe" class="h-4 w-4 shrink-0 rounded-sm" />
