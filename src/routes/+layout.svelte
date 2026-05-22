@@ -1179,6 +1179,18 @@
     }
   }
 
+  async function startWindowDrag(e: PointerEvent) {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement | null;
+    if (target?.closest("button, a, input, textarea, select, [data-no-window-drag]")) return;
+    try {
+      const appWindow = await getTauriWindow();
+      await appWindow?.startDragging();
+    } catch (err) {
+      dbgWarn("layout", "window drag failed", err);
+    }
+  }
+
   async function closeWindow() {
     try {
       const appWindow = await getTauriWindow();
@@ -1344,13 +1356,14 @@
 <div class="flex h-screen flex-col overflow-hidden bg-background text-foreground">
   <div
     class="flex h-8 shrink-0 select-none items-center border-b border-border bg-background text-foreground"
-    data-tauri-drag-region
+    onpointerdown={startWindowDrag}
+    ondblclick={toggleMaximizeWindow}
   >
-    <div class="flex h-full min-w-0 items-center gap-2 px-3" data-tauri-drag-region>
+    <div class="flex h-full min-w-0 items-center gap-2 px-3">
       <img src="/logo.png?v=2" alt="OpenCovibe" class="h-4 w-4 shrink-0 rounded-sm" />
-      <span class="truncate text-xs font-medium" data-tauri-drag-region>OpenCovibe</span>
+      <span class="truncate text-xs font-medium">OpenCovibe</span>
     </div>
-    <div class="h-full flex-1" data-tauri-drag-region></div>
+    <div class="h-full flex-1"></div>
     <div class="flex h-full shrink-0 items-center">
       <button
         class="flex h-8 w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
