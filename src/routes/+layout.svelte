@@ -122,6 +122,7 @@
       : true,
   );
   let effectiveDark = $derived(themeMode === "system" ? systemDark : themeMode === "dark");
+  let isTauriRuntime = $state(false);
   let windowMaximized = $state(false);
   let titlebarDragStart: {
     pointerId: number;
@@ -1149,9 +1150,13 @@
   }
 
   async function getTauriWindow() {
-    if (typeof window === "undefined" || !(window as any).__TAURI_INTERNALS__) return null;
+    if (!isTauriRuntimeAvailable()) return null;
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
     return getCurrentWindow();
+  }
+
+  function isTauriRuntimeAvailable() {
+    return typeof window !== "undefined" && Boolean((window as any).__TAURI_INTERNALS__);
   }
 
   async function refreshWindowMaximized() {
@@ -1186,7 +1191,7 @@
 
   function isWindowDragTarget(target: EventTarget | null): boolean {
     return !(
-      target instanceof HTMLElement &&
+      target instanceof Element &&
       target.closest("button, a, input, textarea, select, [data-no-window-drag]")
     );
   }
@@ -1301,6 +1306,7 @@
 
   // Listen for system preference changes
   onMount(() => {
+    isTauriRuntime = isTauriRuntimeAvailable();
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
     function onSystemChange(e: MediaQueryListEvent) {
       systemDark = e.matches;
@@ -1389,59 +1395,61 @@
 <svelte:window onkeydown={handleKeydown} />
 
 <div class="flex h-screen flex-col overflow-hidden bg-background text-foreground">
-  <div
-    class="flex h-8 shrink-0 select-none items-center border-b border-border bg-background text-foreground"
-    onpointerdown={prepareWindowDrag}
-    onpointermove={startWindowDrag}
-    onpointerup={cancelWindowDrag}
-    onpointercancel={cancelWindowDrag}
-    ondblclick={handleTitlebarDoubleClick}
-  >
-    <div class="flex h-full min-w-0 items-center gap-2 px-3">
-      <img src="/logo.png?v=2" alt="OpenCovibe" class="h-4 w-4 shrink-0 rounded-sm" />
-      <span class="truncate text-xs font-medium">OpenCovibe</span>
-    </div>
-    <div class="h-full flex-1"></div>
-    <div class="flex h-full shrink-0 items-center">
-      <button
-        class="flex h-8 w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-        onclick={minimizeWindow}
-        title="Minimize"
-        aria-label="Minimize window"
-      >
-        <svg class="h-3.5 w-3.5" viewBox="0 0 16 16" fill="currentColor">
-          <path d="M3 8h10v1H3z" />
-        </svg>
-      </button>
-      <button
-        class="flex h-8 w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-        onclick={toggleMaximizeWindow}
-        title={windowMaximized ? "Restore" : "Maximize"}
-        aria-label={windowMaximized ? "Restore window" : "Maximize window"}
-      >
-        {#if windowMaximized}
-          <svg class="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor">
-            <path d="M5.5 3.5h7v7h-7z" />
-            <path d="M3.5 5.5h2v5h5v2h-7z" />
+  {#if isTauriRuntime}
+    <div
+      class="flex h-8 shrink-0 select-none items-center border-b border-border bg-background text-foreground"
+      onpointerdown={prepareWindowDrag}
+      onpointermove={startWindowDrag}
+      onpointerup={cancelWindowDrag}
+      onpointercancel={cancelWindowDrag}
+      ondblclick={handleTitlebarDoubleClick}
+    >
+      <div class="flex h-full min-w-0 items-center gap-2 px-3">
+        <img src="/logo.png?v=2" alt="OpenCovibe" class="h-4 w-4 shrink-0 rounded-sm" />
+        <span class="truncate text-xs font-medium">OpenCovibe</span>
+      </div>
+      <div class="h-full flex-1"></div>
+      <div class="flex h-full shrink-0 items-center">
+        <button
+          class="flex h-8 w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          onclick={minimizeWindow}
+          title="Minimize"
+          aria-label="Minimize window"
+        >
+          <svg class="h-3.5 w-3.5" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M3 8h10v1H3z" />
           </svg>
-        {:else}
+        </button>
+        <button
+          class="flex h-8 w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          onclick={toggleMaximizeWindow}
+          title={windowMaximized ? "Restore" : "Maximize"}
+          aria-label={windowMaximized ? "Restore window" : "Maximize window"}
+        >
+          {#if windowMaximized}
+            <svg class="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor">
+              <path d="M5.5 3.5h7v7h-7z" />
+              <path d="M3.5 5.5h2v5h5v2h-7z" />
+            </svg>
+          {:else}
+            <svg class="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor">
+              <path d="M4.5 4.5h7v7h-7z" />
+            </svg>
+          {/if}
+        </button>
+        <button
+          class="flex h-8 w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-red-500 hover:text-white"
+          onclick={closeWindow}
+          title="Close"
+          aria-label="Close window"
+        >
           <svg class="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor">
-            <path d="M4.5 4.5h7v7h-7z" />
+            <path d="M4 4l8 8M12 4l-8 8" />
           </svg>
-        {/if}
-      </button>
-      <button
-        class="flex h-8 w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-red-500 hover:text-white"
-        onclick={closeWindow}
-        title="Close"
-        aria-label="Close window"
-      >
-        <svg class="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor">
-          <path d="M4 4l8 8M12 4l-8 8" />
-        </svg>
-      </button>
+        </button>
+      </div>
     </div>
-  </div>
+  {/if}
 
   <div class="flex min-h-0 flex-1 overflow-hidden">
     <!-- Sidebar: Icon Rail + Content Panel -->
