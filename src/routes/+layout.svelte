@@ -123,6 +123,11 @@
   );
   let effectiveDark = $derived(themeMode === "system" ? systemDark : themeMode === "dark");
   let windowMaximized = $state(false);
+  let titlebarDragStart: {
+    pointerId: number;
+    x: number;
+    y: number;
+  } | null = null;
   let pinnedCwds = $state<string[]>([]);
   let removedCwds = $state<string[]>([]);
 
@@ -1179,20 +1184,46 @@
     }
   }
 
-  async function startWindowDrag(e: PointerEvent) {
+  function isWindowDragTarget(target: EventTarget | null): boolean {
+    return !(
+      target instanceof HTMLElement &&
+      target.closest("button, a, input, textarea, select, [data-no-window-drag]")
+    );
+  }
+
+  function prepareWindowDrag(e: PointerEvent) {
     if (e.button !== 0) return;
-    const target = e.target as HTMLElement | null;
-    if (target?.closest("button, a, input, textarea, select, [data-no-window-drag]")) return;
-    if (e.detail === 2) {
-      await toggleMaximizeWindow();
+    if (!isWindowDragTarget(e.target)) return;
+    titlebarDragStart = { pointerId: e.pointerId, x: e.clientX, y: e.clientY };
+  }
+
+  async function startWindowDrag(e: PointerEvent) {
+    if (!titlebarDragStart || titlebarDragStart.pointerId !== e.pointerId) return;
+    if ((e.buttons & 1) !== 1) {
+      titlebarDragStart = null;
       return;
     }
+    const dx = Math.abs(e.clientX - titlebarDragStart.x);
+    const dy = Math.abs(e.clientY - titlebarDragStart.y);
+    if (dx < 4 && dy < 4) return;
+    titlebarDragStart = null;
     try {
       const appWindow = await getTauriWindow();
       await appWindow?.startDragging();
     } catch (err) {
       dbgWarn("layout", "window drag failed", err);
     }
+  }
+
+  function cancelWindowDrag(e: PointerEvent) {
+    if (titlebarDragStart?.pointerId === e.pointerId) {
+      titlebarDragStart = null;
+    }
+  }
+
+  async function handleTitlebarDoubleClick(e: MouseEvent) {
+    if (!isWindowDragTarget(e.target)) return;
+    await toggleMaximizeWindow();
   }
 
   async function closeWindow() {
@@ -1360,7 +1391,11 @@
 <div class="flex h-screen flex-col overflow-hidden bg-background text-foreground">
   <div
     class="flex h-8 shrink-0 select-none items-center border-b border-border bg-background text-foreground"
-    onpointerdown={startWindowDrag}
+    onpointerdown={prepareWindowDrag}
+    onpointermove={startWindowDrag}
+    onpointerup={cancelWindowDrag}
+    onpointercancel={cancelWindowDrag}
+    ondblclick={handleTitlebarDoubleClick}
   >
     <div class="flex h-full min-w-0 items-center gap-2 px-3">
       <img src="/logo.png?v=2" alt="OpenCovibe" class="h-4 w-4 shrink-0 rounded-sm" />
