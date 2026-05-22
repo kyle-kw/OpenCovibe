@@ -1394,7 +1394,10 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
-<div class="flex h-screen flex-col overflow-hidden bg-background text-foreground">
+<div
+  class="flex h-screen flex-col overflow-hidden bg-background text-foreground"
+  style:--ocv-titlebar-height={isTauriRuntime ? "2rem" : "0px"}
+>
   {#if isTauriRuntime}
     <div
       class="flex h-8 shrink-0 select-none items-center border-b border-border bg-background text-foreground"
@@ -2462,9 +2465,9 @@
     {#if sidebarResizing}
       <div
         bind:this={sidebarGhostEl}
-        class="fixed top-0 bottom-0 z-[9999] pointer-events-none bg-primary"
+        class="fixed bottom-0 z-[9999] pointer-events-none bg-primary"
         style="left: {sidebarGhostX -
-          1}px; width: 3px; box-shadow: 0 0 8px hsl(var(--primary) / 0.6);"
+          1}px; top: var(--ocv-titlebar-height, 0px); width: 3px; box-shadow: 0 0 8px hsl(var(--primary) / 0.6);"
       ></div>
     {/if}
 

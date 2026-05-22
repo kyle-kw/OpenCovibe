@@ -577,8 +577,9 @@
 {#if resizing}
   <!-- Ghost line during drag: zero-cost preview, no layout reflow elsewhere -->
   <div
-    class="fixed top-0 bottom-0 z-[9999] pointer-events-none bg-primary"
-    style="left: {ghostX - 1}px; width: 3px; box-shadow: 0 0 8px hsl(var(--primary) / 0.6);"
+    class="fixed bottom-0 z-[9999] pointer-events-none bg-primary"
+    style="left: {ghostX -
+      1}px; top: var(--ocv-titlebar-height, 0px); width: 3px; box-shadow: 0 0 8px hsl(var(--primary) / 0.6);"
   ></div>
 {/if}
 <aside
