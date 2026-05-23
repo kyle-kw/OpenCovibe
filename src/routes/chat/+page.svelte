@@ -784,6 +784,22 @@
     } finally {
       loadingMore = false;
     }
+
+    // IntersectionObserver only refires on state changes. If anchor compensation
+    // produced ~zero delta (collapsed/unmeasured entries above the viewport, or
+    // a stable layout where the prepended content all sits within rootMargin),
+    // the sentinel stays "still intersecting" with no new state to deliver — and
+    // the user-scroll re-arm path (handleChatScroll) never fires either because
+    // a same-value scrollTop write may dispatch no scroll event. Re-observing
+    // forces a fresh callback delivery: if the sentinel exited the viewport,
+    // the callback returns early; if still intersecting, it kicks off another
+    // batch, naturally terminating once `filteredTimeline.length <= renderLimit`
+    // or the sentinel exits.
+    if (_topObserver && topSentinel && filteredTimeline.length > renderLimit) {
+      loadMoreArmed = true;
+      _topObserver.unobserve(topSentinel);
+      _topObserver.observe(topSentinel);
+    }
   }
 
   /**
@@ -3203,11 +3219,16 @@
         }
       }
 
-      // Phase 2: parallel file read (concurrency=2 to limit memory)
+      // Phase 2: parallel file read (concurrency=2 to limit memory).
+      // Pass project cwd to read_file_base64 so the backend can validate the
+      // path is inside an allowed root. Files outside the project will reject
+      // — the existing "rejected → path ref" fallback below handles that
+      // gracefully so the user still gets the attachment as a path reference.
+      const dropCwd = store.sessionCwd || store.run?.cwd || "";
       const fileResults = await mapSettled(
         fileEntries,
         async ({ p, name }) => {
-          const [base64, mime] = await api.readFileBase64(p);
+          const [base64, mime] = await api.readFileBase64(p, dropCwd);
           const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
           return { file: new File([bytes], name, { type: mime }), name, mime, size: bytes.length };
         },

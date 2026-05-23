@@ -1144,12 +1144,14 @@ describe("SessionStore reducer", () => {
   // ── result_subtype error flows ──
 
   describe("result_subtype", () => {
-    it("error flows through to phase and error state", () => {
+    it("error flows through to error state but phase stays non-terminal (HC#1)", () => {
       store.run = makeRun("run-err-1");
       store.phase = "running";
       store.applyEventBatch(resultErrorMaxTurnsEvents as BusEvent[]);
 
-      expect(store.phase).toBe("failed");
+      // HC#1: result event = turn complete (→ idle), NOT session end.
+      // Terminal failed/completed is decided in the backend on EOF.
+      expect(store.phase).toBe("idle");
       expect(store.error).toBe("Max turns reached");
       expect(store.timeline).toHaveLength(2); // user + assistant
     });
