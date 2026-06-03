@@ -123,6 +123,9 @@ interface ReduceCtx {
   isStream: boolean;
   /** Per-turn usage snapshots. */
   turnUsages: TurnUsage[];
+  /** High-water context tokens / window since last compaction (drives contextUtilization). */
+  contextHwTokens: number;
+  contextHwWindow: number;
   /** tool_use_id → tl[] index (only tool entries, first-match semantics). */
   toolTlIndex: Map<string, number>;
   /** tool_use_id → he[] index (only HookEvent entries with tool_use_id). */
@@ -312,6 +315,13 @@ export class SessionStore {
   strictMode = false;
   /** Per-turn usage snapshots (append-only, one per usage_update event). */
   turnUsages: TurnUsage[] = $state([]);
+  /** High-water mark of current-context tokens (input+cacheRead+cacheWrite) since the last
+   *  compaction. contextUtilization reads this instead of the latest raw usage so that a
+   *  resumed / partial / cross-process usage_update reporting a smaller snapshot can't crater
+   *  the gauge (Issue #135). Reset on compact_boundary. contextHwWindow remembers the matching
+   *  window so a dip event without modelUsage doesn't zero the denominator. */
+  contextHwTokens: number = $state(0);
+  contextHwWindow: number = $state(0);
   /** Timestamp of the most recent compact_boundary event (0 = never). */
   lastCompactedAt: number = $state(0);
   /** Number of full compaction events in this session. */
@@ -587,25 +597,38 @@ export class SessionStore {
   }
 
   get contextWindow(): number {
-    if (!this.usage.modelUsage) return 0;
-    const entries = Object.values(this.usage.modelUsage);
-    let max = 0;
-    for (const e of entries) {
-      if (e.context_window && e.context_window > max) max = e.context_window;
+    // Prefer the latest event's window; fall back to the high-water window so a dip
+    // event without modelUsage (resume/synth) doesn't zero the denominator. #135
+    if (this.usage.modelUsage) {
+      let max = 0;
+      for (const e of Object.values(this.usage.modelUsage)) {
+        if (e.context_window && e.context_window > max) max = e.context_window;
+      }
+      if (max > 0) return max;
     }
-    return max;
+    return this.contextHwWindow;
   }
 
   get contextUtilization(): number {
-    // Total tokens sent to the model in the latest API call:
-    //   input_tokens (new non-cached) + cache_read (from cache) + cache_write (first-time cached)
-    // All three are part of the context window. Divide by contextWindow for fill %.
-    // These are per-turn values (usage_update replaces, not accumulates).
+    // Fill % = current-context tokens (input + cache_read + cache_write of the latest main
+    // turn) / context window. We read the high-water mark since last compaction, NOT the
+    // latest raw usage: a resumed/partial/cross-process usage_update can report a much smaller
+    // snapshot (different process, cold cache, error result) that must not crater the gauge. #135
     const cw = this.contextWindow;
-    if (cw <= 0) return 0;
-    const used = this.usage.inputTokens + this.usage.cacheReadTokens + this.usage.cacheWriteTokens;
-    if (used <= 0) return 0;
-    return Math.min(used / cw, 1);
+    if (cw <= 0 || this.contextHwTokens <= 0) return 0;
+    return Math.min(this.contextHwTokens / cw, 1);
+  }
+
+  /** Conversation turn count = user messages in the timeline. This is the user-facing turn
+   *  number; it matches the conversation list. Distinct from CLI `num_turns`, which counts
+   *  per-prompt internal API steps and resets across process re-invocations (Issue #135). */
+  get userTurnCount(): number {
+    return this.timeline.filter((e) => e.kind === "user").length;
+  }
+
+  /** Current context size in tokens (high-water since last compaction). */
+  get contextTokens(): number {
+    return this.contextHwTokens;
   }
 
   get contextWarningLevel(): "none" | "moderate" | "high" | "critical" {
@@ -1082,6 +1105,8 @@ export class SessionStore {
       sessionId: null,
       isStream: this.useStreamSession,
       turnUsages: [...this.turnUsages],
+      contextHwTokens: this.contextHwTokens,
+      contextHwWindow: this.contextHwWindow,
       toolTlIndex: batchTlIndex,
       toolHeIndex: batchHeIndex,
       toolInputByUseId: new Map<string, Record<string, unknown>>(),
@@ -1127,6 +1152,8 @@ export class SessionStore {
     this.model = ctx.model;
     this.usage = ctx.usage;
     this.turnUsages = ctx.turnUsages;
+    this.contextHwTokens = ctx.contextHwTokens;
+    this.contextHwWindow = ctx.contextHwWindow;
     this._seenMessageIds = ctx.seenMessageIds;
     this._seenToolIds = ctx.seenToolIds;
     this._toolTlIndex = ctx.toolTlIndex;
@@ -1332,6 +1359,8 @@ export class SessionStore {
     this.numTurns = 0;
     this.durationMs = 0;
     this.turnUsages = [];
+    this.contextHwTokens = 0;
+    this.contextHwWindow = 0;
     this.lastCompactedAt = 0;
     this.compactCount = 0;
     this.microcompactCount = 0;
@@ -1393,6 +1422,8 @@ export class SessionStore {
       model: this.model,
       usage: this.usage,
       turnUsages: this.turnUsages,
+      contextHwTokens: this.contextHwTokens,
+      contextHwWindow: this.contextHwWindow,
       _seenMessageIds: [...this._seenMessageIds],
       _seenToolIds: [...this._seenToolIds],
       // B group (direct fields)
@@ -1415,11 +1446,21 @@ export class SessionStore {
       durationMs: this.durationMs,
       compactCount: this.compactCount,
       microcompactCount: this.microcompactCount,
+      lastCompactedAt: this.lastCompactedAt,
       persistedFiles: this.persistedFiles,
       unknownEventCount: this.unknownEventCount,
       rawFallbackCount: this.rawFallbackCount,
       taskNotifications: [...this.taskNotifications.entries()],
       scheduledTasks: this.scheduledTasks,
+      // Reducer-written run state that idle-snapshot restore must preserve (a snapshot-hit
+      // loadRun skips event replay, so anything not serialized here is lost on revisit). #135-class
+      ralphLoop: this.ralphLoop,
+      rateLimitStatus: this.rateLimitStatus,
+      rateLimitType: this.rateLimitType,
+      rateLimitUtilization: this.rateLimitUtilization,
+      rateLimitResetsAt: this.rateLimitResetsAt,
+      thinkingStartMs: this.thinkingStartMs,
+      thinkingEndMs: this.thinkingEndMs,
       _lastProcessedSeq: this._lastProcessedSeq,
     };
     return JSON.stringify(obj);
@@ -1461,6 +1502,8 @@ export class SessionStore {
       this.model = (obj.model as string) ?? "";
       this.usage = obj.usage as UsageState;
       this.turnUsages = (obj.turnUsages ?? []) as TurnUsage[];
+      this.contextHwTokens = (obj.contextHwTokens as number) ?? 0;
+      this.contextHwWindow = (obj.contextHwWindow as number) ?? 0;
       this._seenMessageIds = new Set((obj._seenMessageIds ?? []) as string[]);
       this._seenToolIds = new Set((obj._seenToolIds ?? []) as string[]);
 
@@ -1484,9 +1527,18 @@ export class SessionStore {
       this.durationMs = (obj.durationMs as number) ?? 0;
       this.compactCount = (obj.compactCount as number) ?? 0;
       this.microcompactCount = (obj.microcompactCount as number) ?? 0;
+      this.lastCompactedAt = (obj.lastCompactedAt as number) ?? 0;
       this.persistedFiles = (obj.persistedFiles ?? []) as unknown[];
       this.unknownEventCount = (obj.unknownEventCount as number) ?? 0;
       this.rawFallbackCount = (obj.rawFallbackCount as number) ?? 0;
+      // Reducer-written run state (see _buildSnapshot). ?? keeps old snapshots valid.
+      this.ralphLoop = (obj.ralphLoop as typeof this.ralphLoop) ?? null;
+      this.rateLimitStatus = (obj.rateLimitStatus as string) ?? "";
+      this.rateLimitType = (obj.rateLimitType as string) ?? "";
+      this.rateLimitUtilization = (obj.rateLimitUtilization as number | null) ?? null;
+      this.rateLimitResetsAt = (obj.rateLimitResetsAt as number | null) ?? null;
+      this.thinkingStartMs = (obj.thinkingStartMs as number) ?? 0;
+      this.thinkingEndMs = (obj.thinkingEndMs as number) ?? 0;
       this.taskNotifications = new Map(
         (obj.taskNotifications ?? []) as Array<[string, TaskNotificationItem]>,
       );
@@ -1879,7 +1931,9 @@ export class SessionStore {
           this._startResponseTimeout(run.id);
         }
       } else {
-        // Codex pipe mode
+        // PipeExec path (Codex): useStreamSession is false iff the freshly
+        // created run has execution_path=pipe_exec, so sendChatMessage is the
+        // correct IPC. SessionActor runs always go through the branch above.
         this._setPhase("running");
         await api.sendChatMessage(run.id, prompt, attachments.length > 0 ? attachments : undefined);
       }
@@ -1900,7 +1954,15 @@ export class SessionStore {
     snapshotCache.deleteSnapshot(this.run.id).catch(() => {});
 
     try {
-      if (this.useStreamSession && this.sessionAlive) {
+      if (this.useStreamSession) {
+        // SessionActor (Claude stream-json): requires a live CLI process.
+        // Why-not fallback: sendChatMessage targets pipe_exec runs only; the
+        // backend rejects it for session_actor runs (commands/chat.rs). When
+        // the process has died, surface a clear error instead of routing to
+        // an IPC that is guaranteed to fail.
+        if (!this.sessionAlive) {
+          throw new Error("Session ended — start a new session to continue.");
+        }
         // Optimistic user message — matches the pattern in startSession().
         // Content-based dedup in _reduce(user_message) prevents double display
         // when the backend's UserMessage bus event arrives.
@@ -1912,6 +1974,7 @@ export class SessionStore {
           this._startResponseTimeout(this.run.id);
         }
       } else {
+        // PipeExec (Codex): one-shot process per message, no liveness concept.
         this._setPhase("running");
         await api.sendChatMessage(
           this.run.id,
@@ -3225,6 +3288,25 @@ export class SessionStore {
         } else {
           this.turnUsages = [...this.turnUsages, turnSnap];
         }
+
+        // Update context high-water (drives contextUtilization). Use this event's own
+        // window; clamp tokens to it so an over-counted snapshot can't exceed 100%. Only
+        // raise tokens, but always adopt the latest non-zero window (200k↔1m can switch). #135
+        if (hasTokens) {
+          const evUsed = u.inputTokens + u.cacheReadTokens + u.cacheWriteTokens;
+          let evWin = 0;
+          if (u.modelUsage) {
+            for (const e of Object.values(u.modelUsage)) {
+              if (e.context_window && e.context_window > evWin) evWin = e.context_window;
+            }
+          }
+          if (evWin > 0) {
+            const hwTgt = ctx ?? this;
+            const clamped = Math.min(evUsed, evWin);
+            hwTgt.contextHwWindow = evWin;
+            if (clamped > hwTgt.contextHwTokens) hwTgt.contextHwTokens = clamped;
+          }
+        }
         break;
       }
 
@@ -3395,6 +3477,10 @@ export class SessionStore {
           const reset = { ...prev, inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
           if (ctx) ctx.usage = reset;
           else this.usage = reset;
+          // Reset the context high-water too — the next usage_update re-establishes the
+          // post-compaction peak. Keep the window (denominator unchanged by compaction). #135
+          const hwTgt = ctx ?? this;
+          hwTgt.contextHwTokens = 0;
         }
         // Only set lastCompactedAt during live mode — during replay
         // the timestamp would be meaningless (Date.now() ≠ original event time).

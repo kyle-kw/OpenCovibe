@@ -591,6 +591,42 @@ describe("SessionStore reducer", () => {
     });
   });
 
+  // ── sendMessage dispatch by execution_path ──
+
+  describe("sendMessage dispatch", () => {
+    beforeEach(() => {
+      vi.mocked(api.sendSessionMessage).mockClear();
+      vi.mocked(api.sendChatMessage).mockClear();
+    });
+
+    it("SessionActor + alive routes to sendSessionMessage", async () => {
+      store.run = makeRun("run-sa-alive", { execution_path: "session_actor" });
+      store.phase = "idle";
+      vi.mocked(api.sendSessionMessage).mockResolvedValueOnce(undefined);
+      await store.sendMessage("hello", []);
+      expect(api.sendSessionMessage).toHaveBeenCalledWith("run-sa-alive", "hello", undefined);
+      expect(api.sendChatMessage).not.toHaveBeenCalled();
+    });
+
+    it("SessionActor + dead throws a clear error (no IPC call)", async () => {
+      store.run = makeRun("run-sa-dead", { execution_path: "session_actor" });
+      store.phase = "completed";
+      await expect(store.sendMessage("hello", [])).rejects.toThrow(/Session ended/);
+      expect(api.sendChatMessage).not.toHaveBeenCalled();
+      expect(api.sendSessionMessage).not.toHaveBeenCalled();
+      expect(store.error).toMatch(/Session ended/);
+    });
+
+    it("PipeExec routes to sendChatMessage regardless of phase", async () => {
+      store.run = makeRun("run-pe", { execution_path: "pipe_exec", agent: "codex" });
+      store.phase = "idle";
+      vi.mocked(api.sendChatMessage).mockResolvedValueOnce(undefined);
+      await store.sendMessage("hello", []);
+      expect(api.sendChatMessage).toHaveBeenCalledWith("run-pe", "hello", undefined);
+      expect(api.sendSessionMessage).not.toHaveBeenCalled();
+    });
+  });
+
   // ── Terminal run ask_pending resolution ──
 
   describe("terminal run ask_pending cleanup", () => {
@@ -1144,12 +1180,14 @@ describe("SessionStore reducer", () => {
   // ── result_subtype error flows ──
 
   describe("result_subtype", () => {
-    it("error flows through to phase and error state", () => {
+    it("error flows through to error state but phase stays non-terminal (HC#1)", () => {
       store.run = makeRun("run-err-1");
       store.phase = "running";
       store.applyEventBatch(resultErrorMaxTurnsEvents as BusEvent[]);
 
-      expect(store.phase).toBe("failed");
+      // HC#1: result event = turn complete (→ idle), NOT session end.
+      // Terminal failed/completed is decided in the backend on EOF.
+      expect(store.phase).toBe("idle");
       expect(store.error).toBe("Max turns reached");
       expect(store.timeline).toHaveLength(2); // user + assistant
     });
@@ -2023,6 +2061,46 @@ describe("SessionStore reducer", () => {
       ) as Extract<TimelineEntry, { kind: "tool" }>;
       expect(toolEntry).toBeDefined();
       expect(toolEntry.tool.status).toBe("error");
+    });
+  });
+
+  describe("snapshot round-trip (reducer-written run state)", () => {
+    // Regression for the #135-class snapshot-omission bug: an idle-snapshot loadRun
+    // skips event replay, so any reducer-written field not serialized is lost on revisit.
+    it("preserves ralphLoop / rate-limit / lastCompactedAt / thinking timers across build→restore", () => {
+      store.run = makeRun("run-snap");
+      store.ralphLoop = {
+        active: true,
+        prompt: "Build an API",
+        iteration: 3,
+        maxIterations: 10,
+        completionPromise: "DONE",
+        startedAt: "2026-06-01T00:00:00Z",
+        reason: null,
+      };
+      store.rateLimitStatus = "allowed_warning";
+      store.rateLimitType = "five_hour";
+      store.rateLimitUtilization = 0.82;
+      store.rateLimitResetsAt = 1780000000000;
+      store.lastCompactedAt = 1779999999999;
+      store.thinkingStartMs = 111;
+      store.thinkingEndMs = 222;
+
+      const snap = (store as unknown as { _buildSnapshot(): string })._buildSnapshot();
+      const restored = new SessionStore();
+      const ok = (
+        restored as unknown as { _tryApplySnapshot(b: string): boolean }
+      )._tryApplySnapshot(snap);
+
+      expect(ok).toBe(true);
+      expect(restored.ralphLoop).toEqual(store.ralphLoop);
+      expect(restored.rateLimitStatus).toBe("allowed_warning");
+      expect(restored.rateLimitType).toBe("five_hour");
+      expect(restored.rateLimitUtilization).toBe(0.82);
+      expect(restored.rateLimitResetsAt).toBe(1780000000000);
+      expect(restored.lastCompactedAt).toBe(1779999999999);
+      expect(restored.thinkingStartMs).toBe(111);
+      expect(restored.thinkingEndMs).toBe(222);
     });
   });
 

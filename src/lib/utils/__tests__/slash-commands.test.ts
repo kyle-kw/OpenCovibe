@@ -301,6 +301,18 @@ describe("mergeWithVirtual", () => {
     expect(merged[0].description).toBe("Custom desc");
   });
 
+  it("fills description for /simplify (CLI 2.1.154 re-add)", () => {
+    const cli: CliCommand[] = [{ name: "simplify", description: "", aliases: [] }];
+    const merged = mergeWithVirtual(cli);
+    expect(merged.find((c) => c.name === "simplify")?.description).toBeTruthy();
+  });
+
+  it("fills description for /reload-skills (CLI 2.1.152)", () => {
+    const cli: CliCommand[] = [{ name: "reload-skills", description: "", aliases: [] }];
+    const merged = mergeWithVirtual(cli);
+    expect(merged.find((c) => c.name === "reload-skills")?.description).toBeTruthy();
+  });
+
   it("leaves unknown commands without description unchanged", () => {
     const cli: CliCommand[] = [{ name: "my-custom-skill", description: "", aliases: [] }];
     const merged = mergeWithVirtual(cli);
@@ -458,12 +470,14 @@ describe("getCommandCategory", () => {
     expect(getCommandCategory("model")).toBe("coding");
     expect(getCommandCategory("review")).toBe("coding");
     expect(getCommandCategory("plan")).toBe("coding");
+    expect(getCommandCategory("simplify")).toBe("coding"); // CLI 2.1.154 re-add
   });
 
   it('returns "config" for known config commands', () => {
     expect(getCommandCategory("config")).toBe("config");
     expect(getCommandCategory("mcp")).toBe("config");
     expect(getCommandCategory("vim")).toBe("config");
+    expect(getCommandCategory("reload-skills")).toBe("config"); // CLI 2.1.152
   });
 
   it('returns "help" for known help commands', () => {

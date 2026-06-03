@@ -1157,7 +1157,8 @@ export type HookEventType =
   | "TaskCreated"
   | "CwdChanged"
   | "FileChanged"
-  | "PermissionDenied";
+  | "PermissionDenied"
+  | "MessageDisplay";
 
 export interface HookHandler {
   type: "command" | "prompt" | "http" | "mcp_tool";
