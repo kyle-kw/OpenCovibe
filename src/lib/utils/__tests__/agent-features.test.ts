@@ -11,13 +11,14 @@ describe("getAgentFeatures", () => {
     expect(f.addDirAction).toBe(true);
   });
 
-  it("returns minimal features for codex", () => {
+  it("returns codex features with effort/planMode/permissionMode/addDir enabled (app-server live switching)", () => {
     const f = getAgentFeatures("codex");
-    expect(f.effortSelector).toBe(false);
-    expect(f.planModeToggle).toBe(false);
-    expect(f.permissionModeSwitch).toBe(false);
-    expect(f.slashCommandMenu).toBe(false);
-    expect(f.addDirAction).toBe(false);
+    expect(f.effortSelector).toBe(true);
+    expect(f.planModeToggle).toBe(true);
+    // Wave-2: app-server transport supports live permission-mode switching.
+    expect(f.permissionModeSwitch).toBe(true);
+    expect(f.slashCommandMenu).toBe(true);
+    expect(f.addDirAction).toBe(true);
   });
 
   it("returns minimal features for unknown agent", () => {

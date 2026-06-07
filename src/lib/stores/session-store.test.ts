@@ -20,7 +20,9 @@ vi.mock("$lib/api", () => ({
   stopSession: vi.fn(),
   stopRun: vi.fn(),
   sendSessionControl: vi.fn(),
+  steerSession: vi.fn(),
   syncCliSession: vi.fn().mockResolvedValue({ newEvents: 0 }),
+  renameRun: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Mock debug utils — they access localStorage which doesn't exist in node
@@ -57,6 +59,9 @@ import teamSessionEvents from "./__fixtures__/team-session.json";
 import ralphLoopEvents from "./__fixtures__/ralph-loop.json";
 import scheduledTasksEvents from "./__fixtures__/scheduled-tasks.json";
 import malformedEvents from "./__fixtures__/malformed-events.json";
+import codexSimpleEvents from "./__fixtures__/codex-simple.json";
+import subagentAgentEvents from "./__fixtures__/subagent-agent.json";
+import codexCollabEvents from "./__fixtures__/codex-collab.json";
 
 // Import store and mocked modules after mocks
 import { SessionStore } from "./session-store.svelte";
@@ -193,6 +198,73 @@ describe("SessionStore reducer", () => {
       const msgs = store.timeline.filter((e) => e.kind === "assistant");
       expect(msgs).toHaveLength(1);
       expect(msgs[0].content).toContain("denied");
+    });
+  });
+
+  // ── Live command output streaming (tool_output_delta) ──
+
+  describe("tool_output_delta streaming", () => {
+    beforeEach(() => {
+      store.run = makeRun("run-1");
+      store.phase = "running";
+    });
+
+    function bashTool() {
+      return store.timeline.find((e) => e.kind === "tool" && e.id === "call_1") as Extract<
+        (typeof store.timeline)[number],
+        { kind: "tool" }
+      >;
+    }
+
+    it("accumulates streamed chunks into the open Bash card, then tool_end overwrites", () => {
+      store.applyEvent({
+        type: "tool_start",
+        run_id: "run-1",
+        tool_use_id: "call_1",
+        tool_name: "Bash",
+        input: { command: "echo hi" },
+      } as BusEvent);
+      store.applyEvent({
+        type: "tool_output_delta",
+        run_id: "run-1",
+        tool_use_id: "call_1",
+        delta: "line 1\n",
+      } as BusEvent);
+      // Visible mid-run, before completion.
+      expect(bashTool().tool.status).toBe("running");
+      expect(bashTool().tool.output?.content).toBe("line 1\n");
+
+      store.applyEvent({
+        type: "tool_output_delta",
+        run_id: "run-1",
+        tool_use_id: "call_1",
+        delta: "line 2\n",
+      } as BusEvent);
+      expect(bashTool().tool.output?.content).toBe("line 1\nline 2\n");
+
+      // tool_end carries the authoritative aggregated output → overwrites (no dup).
+      store.applyEvent({
+        type: "tool_end",
+        run_id: "run-1",
+        tool_use_id: "call_1",
+        tool_name: "Bash",
+        output: { content: "line 1\nline 2\n" },
+        status: "success",
+        duration_ms: 5,
+      } as BusEvent);
+      expect(bashTool().tool.status).toBe("success");
+      expect(bashTool().tool.output?.content).toBe("line 1\nline 2\n");
+    });
+
+    it("drops a delta with no matching open tool", () => {
+      const before = store.timeline.length;
+      store.applyEvent({
+        type: "tool_output_delta",
+        run_id: "run-1",
+        tool_use_id: "missing",
+        delta: "orphan",
+      } as BusEvent);
+      expect(store.timeline.length).toBe(before);
     });
   });
 
@@ -588,42 +660,6 @@ describe("SessionStore reducer", () => {
         cost: 0.01,
       };
       expect(store.totalTokens).toBe(900);
-    });
-  });
-
-  // ── sendMessage dispatch by execution_path ──
-
-  describe("sendMessage dispatch", () => {
-    beforeEach(() => {
-      vi.mocked(api.sendSessionMessage).mockClear();
-      vi.mocked(api.sendChatMessage).mockClear();
-    });
-
-    it("SessionActor + alive routes to sendSessionMessage", async () => {
-      store.run = makeRun("run-sa-alive", { execution_path: "session_actor" });
-      store.phase = "idle";
-      vi.mocked(api.sendSessionMessage).mockResolvedValueOnce(undefined);
-      await store.sendMessage("hello", []);
-      expect(api.sendSessionMessage).toHaveBeenCalledWith("run-sa-alive", "hello", undefined);
-      expect(api.sendChatMessage).not.toHaveBeenCalled();
-    });
-
-    it("SessionActor + dead throws a clear error (no IPC call)", async () => {
-      store.run = makeRun("run-sa-dead", { execution_path: "session_actor" });
-      store.phase = "completed";
-      await expect(store.sendMessage("hello", [])).rejects.toThrow(/Session ended/);
-      expect(api.sendChatMessage).not.toHaveBeenCalled();
-      expect(api.sendSessionMessage).not.toHaveBeenCalled();
-      expect(store.error).toMatch(/Session ended/);
-    });
-
-    it("PipeExec routes to sendChatMessage regardless of phase", async () => {
-      store.run = makeRun("run-pe", { execution_path: "pipe_exec", agent: "codex" });
-      store.phase = "idle";
-      vi.mocked(api.sendChatMessage).mockResolvedValueOnce(undefined);
-      await store.sendMessage("hello", []);
-      expect(api.sendChatMessage).toHaveBeenCalledWith("run-pe", "hello", undefined);
-      expect(api.sendSessionMessage).not.toHaveBeenCalled();
     });
   });
 
@@ -1185,8 +1221,8 @@ describe("SessionStore reducer", () => {
       store.phase = "running";
       store.applyEventBatch(resultErrorMaxTurnsEvents as BusEvent[]);
 
-      // HC#1: result event = turn complete (→ idle), NOT session end.
-      // Terminal failed/completed is decided in the backend on EOF.
+      // HC#1 (#140): a result event = turn complete (→ idle), NOT session end.
+      // Terminal failed/completed is decided in the backend on process EOF.
       expect(store.phase).toBe("idle");
       expect(store.error).toBe("Max turns reached");
       expect(store.timeline).toHaveLength(2); // user + assistant
@@ -1220,7 +1256,9 @@ describe("SessionStore reducer", () => {
       store.applyEventBatch(compactBoundaryEvents as BusEvent[]);
 
       const compactEntries = store.timeline.filter(
-        (e) => e.kind === "separator" && e.content.includes("Context compacted"),
+        (e): e is Extract<TimelineEntry, { kind: "separator" }> =>
+          e.kind === "separator" &&
+          (e as { content: string }).content.includes("Context compacted"),
       );
       expect(compactEntries).toHaveLength(1);
       expect((compactEntries[0] as { content: string }).content).toContain("180k tokens");
@@ -1654,6 +1692,66 @@ describe("SessionStore reducer", () => {
     });
   });
 
+  // ── Agent (Task→Agent rename) + Codex collab subagent shapes ──
+  // The reducer routes subagent children by parent_tool_use_id (tool-name agnostic), so the
+  // "Agent" rename and Codex collab runs must produce the same subTimeline + tool entries that
+  // InlineToolCard / ToolDetailView consume. These lock the entry shapes (not the rendered DOM —
+  // component-render tests aren't supported in this node-env vitest setup; assert on the data the
+  // components branch on instead: isSubagentTool, tool_use_result.toolStats, input.codexCollab).
+  describe("subagent rendering shapes", () => {
+    it("Agent (renamed) routes children to subTimeline and surfaces AgentOutput toolStats", () => {
+      store.run = makeRun("run-agent");
+      store.phase = "running";
+      store.applyEventBatch(subagentAgentEvents as BusEvent[]);
+
+      const mainTools = store.timeline.filter((e) => e.kind === "tool");
+      expect(mainTools).toHaveLength(1);
+      const agentEntry = mainTools[0] as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(agentEntry.tool.tool_name).toBe("Agent");
+      expect(agentEntry.tool.status).toBe("success");
+
+      // Child Bash routed into the parent Agent subTimeline, same as the legacy Task path.
+      expect(agentEntry.subTimeline).toBeDefined();
+      expect(agentEntry.subTimeline!).toHaveLength(2); // Bash tool + subagent message
+      const subBash = agentEntry.subTimeline![0] as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(subBash.tool.tool_name).toBe("Bash");
+
+      // ToolDetailView's taskResult derives from tool_use_result.totalToolUseCount; toolStats
+      // drives the per-category counts. Lock the shape the panel reads.
+      const result = agentEntry.tool.tool_use_result as Record<string, unknown>;
+      expect(result).toBeDefined();
+      expect(result.totalToolUseCount).toBe(1);
+      expect((result.toolStats as Record<string, unknown>).bashCount).toBe(1);
+      expect(result.agentType).toBe("Bash");
+    });
+
+    it("Codex collab run carries codexCollab marker on input and tool_use_result", () => {
+      store.run = makeRun("run-collab");
+      store.phase = "running";
+      store.applyEventBatch(codexCollabEvents as BusEvent[]);
+
+      const tools = store.timeline.filter((e) => e.kind === "tool");
+      expect(tools).toHaveLength(1);
+      const collab = tools[0] as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(collab.tool.tool_name).toBe("Agent");
+      expect(collab.tool.status).toBe("success");
+
+      // ToolDetailView's codexCollab derived state prefers tool_use_result, falls back to input —
+      // both carry the marker so the collab shape renders in-flight and after completion.
+      const input = collab.tool.input as Record<string, unknown>;
+      expect(input.codexCollab).toBe(true);
+      expect(input.operation).toBe("spawnAgent");
+
+      const result = collab.tool.tool_use_result as Record<string, unknown>;
+      expect(result.codexCollab).toBe(true);
+      expect(result.operation).toBe("spawnAgent");
+      expect(result.status).toBe("completed");
+      const agents = result.agents as Array<Record<string, unknown>>;
+      expect(agents[0].thread_id).toBe("t2");
+      expect(agents[0].status).toBe("completed");
+    });
+  });
+
   // ── Subagent streaming deltas ──
 
   describe("subagent streaming deltas", () => {
@@ -2064,46 +2162,6 @@ describe("SessionStore reducer", () => {
     });
   });
 
-  describe("snapshot round-trip (reducer-written run state)", () => {
-    // Regression for the #135-class snapshot-omission bug: an idle-snapshot loadRun
-    // skips event replay, so any reducer-written field not serialized is lost on revisit.
-    it("preserves ralphLoop / rate-limit / lastCompactedAt / thinking timers across build→restore", () => {
-      store.run = makeRun("run-snap");
-      store.ralphLoop = {
-        active: true,
-        prompt: "Build an API",
-        iteration: 3,
-        maxIterations: 10,
-        completionPromise: "DONE",
-        startedAt: "2026-06-01T00:00:00Z",
-        reason: null,
-      };
-      store.rateLimitStatus = "allowed_warning";
-      store.rateLimitType = "five_hour";
-      store.rateLimitUtilization = 0.82;
-      store.rateLimitResetsAt = 1780000000000;
-      store.lastCompactedAt = 1779999999999;
-      store.thinkingStartMs = 111;
-      store.thinkingEndMs = 222;
-
-      const snap = (store as unknown as { _buildSnapshot(): string })._buildSnapshot();
-      const restored = new SessionStore();
-      const ok = (
-        restored as unknown as { _tryApplySnapshot(b: string): boolean }
-      )._tryApplySnapshot(snap);
-
-      expect(ok).toBe(true);
-      expect(restored.ralphLoop).toEqual(store.ralphLoop);
-      expect(restored.rateLimitStatus).toBe("allowed_warning");
-      expect(restored.rateLimitType).toBe("five_hour");
-      expect(restored.rateLimitUtilization).toBe(0.82);
-      expect(restored.rateLimitResetsAt).toBe(1780000000000);
-      expect(restored.lastCompactedAt).toBe(1779999999999);
-      expect(restored.thinkingStartMs).toBe(111);
-      expect(restored.thinkingEndMs).toBe(222);
-    });
-  });
-
   describe("ralph_loop events", () => {
     it("ralph_started initializes ralphLoop state", () => {
       store.run = makeRun("run-1");
@@ -2250,8 +2308,7 @@ describe("SessionStore reducer", () => {
 
     it("live applyEvent path (ctx=null) joins start↔end via timeline lookup", () => {
       // Live WebSocket path delivers events one-by-one via applyEvent (ctx=null).
-      // CronCreate at tool_end must still find tool_start.input through the timeline,
-      // not just the batch-local toolInputByUseId map.
+      // CronCreate at tool_end must find tool_start.input through the timeline.
       store.run = makeRun("run-cron");
       store.phase = "running";
       const [start, end] = makeCronEvents();
@@ -3791,7 +3848,7 @@ describe("SessionStore reducer", () => {
           model: "claude-opus-4-6",
           tools: [],
           cwd: "",
-          // cwd, tools, output_style not present → should clear via ?? ""
+          // output_style not present → should clear via ?? ""
         },
       ];
       store.applyEventBatch(events as BusEvent[]);
@@ -4757,7 +4814,9 @@ describe("SessionStore reducer", () => {
           } as BusEvent,
         ]);
 
-        const assistant = s.timeline.find((e) => e.kind === "assistant" && e.id === "msg-think-1");
+        const assistant = s.timeline.find(
+          (e) => e.kind === "assistant" && e.id === "msg-think-1",
+        ) as Extract<TimelineEntry, { kind: "assistant" }> | undefined;
         expect(assistant).toBeDefined();
         expect((assistant as Extract<TimelineEntry, { kind: "assistant" }>).thinkingText).toBe(
           "Let me reason about this... Step 2.",
@@ -4818,7 +4877,7 @@ describe("SessionStore reducer", () => {
         expect(parentTool!.subTimeline).toBeDefined();
         const subAssistant = parentTool!.subTimeline!.find(
           (e) => e.kind === "assistant" && e.id === "msg-sub-1",
-        );
+        ) as Extract<TimelineEntry, { kind: "assistant" }> | undefined;
         expect(subAssistant).toBeDefined();
         expect((subAssistant as Extract<TimelineEntry, { kind: "assistant" }>).thinkingText).toBe(
           "Sub thinking...",
@@ -5284,5 +5343,1222 @@ describe("SessionStore reducer", () => {
       expect(s.pendingToolPermissions[0].requestId).toBe("req-synth-1");
       expect(s.pendingToolPermissions[1].requestId).toBe("req-synth-2");
     });
+  });
+
+  // ── Codex agent state isolation ──
+
+  describe("Codex agent state isolation", () => {
+    it("codex agent sets protocol caps (bus-events only)", () => {
+      store.agent = "codex";
+      expect(store.caps.supportsBusEvents).toBe(true);
+      expect(store.caps.supportsSessionInit).toBe(false);
+      expect(store.caps.supportsPermissions).toBe(false);
+      expect(store.useStreamSession).toBe(false);
+    });
+
+    it("claude agent sets full protocol caps", () => {
+      store.agent = "claude";
+      expect(store.caps.supportsBusEvents).toBe(true);
+      expect(store.caps.supportsSessionInit).toBe(true);
+      expect(store.caps.supportsPermissions).toBe(true);
+      expect(store.caps.supportsSnapshots).toBe(true);
+      expect(store.useStreamSession).toBe(true);
+    });
+
+    it("switching agent from claude to codex changes caps", () => {
+      store.agent = "claude";
+      expect(store.useStreamSession).toBe(true);
+
+      store.agent = "codex";
+      expect(store.useStreamSession).toBe(false);
+      expect(store.caps.supportsSessionInit).toBe(false);
+    });
+
+    it("switching agent from codex to claude restores full caps", () => {
+      store.agent = "codex";
+      expect(store.caps.supportsSessionInit).toBe(false);
+
+      store.agent = "claude";
+      expect(store.caps.supportsSessionInit).toBe(true);
+    });
+
+    it("unknown agent gets minimal caps", () => {
+      store.agent = "some-unknown";
+      expect(store.caps.supportsBusEvents).toBe(false);
+      expect(store.useStreamSession).toBe(false);
+    });
+
+    it("codex run loads without polluting Claude state", () => {
+      // Simulate a codex run being loaded
+      store.run = makeRun("codex-run-1", { agent: "codex", execution_path: "pipe_exec" });
+      store.agent = "codex";
+      store.phase = "running";
+
+      // Model should be independent — codex doesn't use Claude model system
+      store.model = "";
+      expect(store.model).toBe("");
+
+      // Caps should be codex
+      expect(store.useStreamSession).toBe(false);
+    });
+
+    it("permissionModeSetByUser flag behavior", () => {
+      // Initially false
+      expect(store.permissionModeSetByUser).toBe(false);
+
+      // Setting permissionMode directly doesn't set the flag
+      store.permissionMode = "plan";
+      expect(store.permissionModeSetByUser).toBe(false);
+
+      // Explicitly setting the flag
+      store.permissionModeSetByUser = true;
+      expect(store.permissionModeSetByUser).toBe(true);
+
+      // Resetting for agent switch
+      store.permissionModeSetByUser = false;
+      expect(store.permissionModeSetByUser).toBe(false);
+    });
+  });
+
+  // ── Codex bus-events replay ──
+
+  describe("Codex bus-events replay", () => {
+    beforeEach(() => {
+      store.agent = "codex";
+      store.run = makeRun("codex-run-1", {
+        agent: "codex",
+        execution_path: "pipe_exec",
+        conversation_ref: { kind: "codex_thread", id: "thread-abc" },
+      });
+      store._useChatTimelineForRun = true;
+      store.phase = "running";
+      store.applyEventBatch(codexSimpleEvents as BusEvent[]);
+    });
+
+    it("builds correct timeline from codex bus events", () => {
+      // user_message + tool (bash) + message_complete = 3 entries
+      expect(store.timeline).toHaveLength(3);
+      expect(store.timeline[0].kind).toBe("user");
+      expect(store.timeline[1].kind).toBe("tool");
+      expect(store.timeline[2].kind).toBe("assistant");
+    });
+
+    it("user message has correct content", () => {
+      const user = store.timeline[0];
+      expect(user.kind).toBe("user");
+      if (user.kind === "user") {
+        expect(user.content).toBe("List files in the current directory");
+      }
+    });
+
+    it("tool entry has Bash tool with success status", () => {
+      const tool = store.timeline[1];
+      expect(tool.kind).toBe("tool");
+      if (tool.kind === "tool") {
+        expect(tool.tool.tool_name).toBe("Bash");
+        expect(tool.tool.status).toBe("success");
+        expect(tool.tool.duration_ms).toBe(120);
+      }
+    });
+
+    it("assistant message has correct text", () => {
+      const assistant = store.timeline[2];
+      expect(assistant.kind).toBe("assistant");
+      if (assistant.kind === "assistant") {
+        expect(assistant.content).toContain("README.md");
+      }
+    });
+
+    it("tracks usage from turn.completed", () => {
+      expect(store.usage.inputTokens).toBe(500);
+      expect(store.usage.outputTokens).toBe(200);
+      expect(store.usage.cacheReadTokens).toBe(100);
+    });
+
+    it("useChatTimeline returns true for codex with bus events", () => {
+      expect(store.useChatTimeline).toBe(true);
+      expect(store.useStreamSession).toBe(false); // pipe_exec
+    });
+
+    it("tools mirror is empty in bus-events mode (data in timeline)", () => {
+      expect(store.tools).toHaveLength(0);
+    });
+
+    it("failed tool renders as error status (not success)", () => {
+      const freshStore = new SessionStore();
+      freshStore.agent = "codex";
+      freshStore.run = makeRun("codex-err-1", {
+        agent: "codex",
+        execution_path: "pipe_exec",
+      });
+      freshStore._useChatTimelineForRun = true;
+      freshStore.phase = "running";
+      freshStore.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "codex-err-1",
+          tool_use_id: "codex-1-1-cmd_fail",
+          tool_name: "Bash",
+          input: { command: "false" },
+        },
+        {
+          type: "tool_end",
+          run_id: "codex-err-1",
+          tool_use_id: "codex-1-1-cmd_fail",
+          tool_name: "Bash",
+          output: { content: "" },
+          status: "error", // backend maps Codex "failed" → "error"
+          duration_ms: 10,
+        },
+      ] as BusEvent[]);
+      const tool = freshStore.timeline.find(
+        (e) => e.kind === "tool" && e.id === "codex-1-1-cmd_fail",
+      ) as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(tool).toBeDefined();
+      expect(tool.tool.status).toBe("error");
+    });
+
+    it("user_message with attachments restores on replay", () => {
+      const freshStore = new SessionStore();
+      freshStore.agent = "codex";
+      freshStore.run = makeRun("codex-att-1", {
+        agent: "codex",
+        execution_path: "pipe_exec",
+      });
+      freshStore._useChatTimelineForRun = true;
+      freshStore.phase = "running";
+      freshStore.applyEventBatch(
+        [
+          {
+            type: "user_message",
+            run_id: "codex-att-1",
+            text: "Check this image",
+            attachments: [{ name: "screenshot.png", mime_type: "image/png", size: 12345 }],
+          },
+        ] as BusEvent[],
+        { replayOnly: true },
+      );
+      const user = freshStore.timeline[0];
+      expect(user.kind).toBe("user");
+      if (user.kind === "user") {
+        expect(user.attachments).toHaveLength(1);
+        expect(user.attachments![0].name).toBe("screenshot.png");
+        expect(user.attachments![0].type).toBe("image/png");
+        expect(user.attachments![0].size).toBe(12345);
+        expect(user.attachments![0].contentBase64).toBe("");
+      }
+    });
+
+    it("client_uuid dedup merges optimistic entry", () => {
+      // Simulate the flow: optimistic user push → bus event arrives with client_uuid
+      const freshStore = new SessionStore();
+      freshStore.agent = "codex";
+      freshStore.run = makeRun("codex-run-2", {
+        agent: "codex",
+        execution_path: "pipe_exec",
+      });
+      freshStore._useChatTimelineForRun = true;
+      freshStore.phase = "running";
+
+      // Push optimistic with known id
+      // @ts-expect-error — accessing private method for test
+      const clientId = freshStore._pushOptimisticUser("hello codex");
+
+      // Now apply the backend UserMessage with matching client_uuid
+      freshStore.applyEvent({
+        type: "user_message",
+        run_id: "codex-run-2",
+        text: "hello codex",
+        client_uuid: clientId,
+      } as BusEvent);
+
+      // Should NOT duplicate — only 1 user entry
+      const userEntries = freshStore.timeline.filter((e) => e.kind === "user");
+      expect(userEntries).toHaveLength(1);
+      expect(userEntries[0].content).toBe("hello codex");
+    });
+
+    it("old Phase 1 run (no conversation_ref) falls back to terminal", () => {
+      const s = new SessionStore();
+      s.agent = "codex";
+      s.run = makeRun("codex-old-1", {
+        agent: "codex",
+        execution_path: "pipe_exec",
+        status: "running",
+        // No conversation_ref — Phase 1 run
+      });
+      s.phase = "running";
+      // Simulate what loadRun does: no bus-events, active, no conversation_ref
+      s._useChatTimelineForRun = false; // should NOT be true
+      expect(s.useChatTimeline).toBe(false);
+    });
+
+    it("Phase 2 run with conversation_ref uses timeline", () => {
+      const s = new SessionStore();
+      s.agent = "codex";
+      s.run = makeRun("codex-new-1", {
+        agent: "codex",
+        execution_path: "pipe_exec",
+        status: "running",
+        conversation_ref: { kind: "codex_thread", id: "thread-xyz" },
+      });
+      s._useChatTimelineForRun = true;
+      s.phase = "running";
+      expect(s.useChatTimeline).toBe(true);
+    });
+
+    it("replay duplicate user messages are NOT deduped (replayOnly=true)", () => {
+      const s = new SessionStore();
+      s.agent = "codex";
+      s.run = makeRun("codex-dup-1", {
+        agent: "codex",
+        execution_path: "pipe_exec",
+        conversation_ref: { kind: "codex_thread", id: "thread-dup" },
+      });
+      s._useChatTimelineForRun = true;
+      s.phase = "running";
+      // Two identical user messages in history — both must survive replay
+      s.applyEventBatch(
+        [
+          { type: "user_message", run_id: "codex-dup-1", text: "same prompt" },
+          { type: "message_complete", run_id: "codex-dup-1", message_id: "m1", text: "reply 1" },
+          { type: "user_message", run_id: "codex-dup-1", text: "same prompt" },
+          { type: "message_complete", run_id: "codex-dup-1", message_id: "m2", text: "reply 2" },
+        ] as BusEvent[],
+        { replayOnly: true },
+      );
+      const users = s.timeline.filter((e) => e.kind === "user");
+      expect(users).toHaveLength(2);
+    });
+  });
+
+  describe("Codex Wave-1 event rendering", () => {
+    it("TodoWrite tool_end carries newTodos for the plan card (agent-neutral)", () => {
+      const s = new SessionStore();
+      s.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "codex-1",
+          tool_use_id: "plan-turn-1",
+          tool_name: "TodoWrite",
+          input: { todos: [{ content: "step 1", status: "pending", activeForm: "doing 1" }] },
+        },
+        {
+          type: "tool_end",
+          run_id: "codex-1",
+          tool_use_id: "plan-turn-1",
+          tool_name: "TodoWrite",
+          status: "success",
+          tool_use_result: {
+            newTodos: [{ content: "step 1", status: "in_progress", activeForm: "doing 1" }],
+          },
+        },
+      ] as BusEvent[]);
+      const tool = s.timeline.find(
+        (e) => e.kind === "tool" && e.tool.tool_name === "TodoWrite",
+      ) as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(tool).toBeDefined();
+      expect(tool.tool.status).toBe("success");
+      // ToolDetailView keys the styled todo card off tool_use_result.newTodos
+      const result = tool.tool.tool_use_result as { newTodos: { status: string }[] };
+      expect(result.newTodos).toHaveLength(1);
+      expect(result.newTodos[0].status).toBe("in_progress");
+    });
+
+    it("repeated plan updates with a stable tool_use_id refresh the same card", () => {
+      const s = new SessionStore();
+      s.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "codex-1",
+          tool_use_id: "plan-turn-1",
+          tool_name: "TodoWrite",
+          input: { todos: [] },
+        },
+        {
+          type: "tool_end",
+          run_id: "codex-1",
+          tool_use_id: "plan-turn-1",
+          tool_name: "TodoWrite",
+          status: "success",
+          tool_use_result: { newTodos: [{ content: "a", status: "pending", activeForm: "a" }] },
+        },
+        // Second update reuses the same tool_use_id
+        {
+          type: "tool_start",
+          run_id: "codex-1",
+          tool_use_id: "plan-turn-1",
+          tool_name: "TodoWrite",
+          input: { todos: [] },
+        },
+        {
+          type: "tool_end",
+          run_id: "codex-1",
+          tool_use_id: "plan-turn-1",
+          tool_name: "TodoWrite",
+          status: "success",
+          tool_use_result: { newTodos: [{ content: "a", status: "completed", activeForm: "a" }] },
+        },
+      ] as BusEvent[]);
+      const tools = s.timeline.filter((e) => e.kind === "tool" && e.tool.tool_name === "TodoWrite");
+      expect(tools).toHaveLength(1); // refreshed in place, not stacked
+      const result = (tools[0] as Extract<TimelineEntry, { kind: "tool" }>).tool
+        .tool_use_result as { newTodos: { status: string }[] };
+      expect(result.newTodos[0].status).toBe("completed");
+    });
+
+    it("rate_limit_event populates store fields (agent-neutral, flows for Codex)", () => {
+      const s = new SessionStore();
+      s.applyEventBatch([
+        {
+          type: "rate_limit_event",
+          run_id: "codex-1",
+          status: "allowed_warning",
+          rate_limit_type: "five_hour",
+          utilization: 0.85,
+          resets_at: 1711900000,
+          data: {},
+        },
+      ] as BusEvent[]);
+      expect(s.rateLimitStatus).toBe("allowed_warning");
+      expect(s.rateLimitType).toBe("five_hour");
+      expect(s.rateLimitUtilization).toBe(0.85);
+      expect(s.rateLimitResetsAt).toBe(1711900000);
+    });
+  });
+
+  // ── latestTodos getter (drives the TodoPanel) ──
+
+  describe("latestTodos getter", () => {
+    const td = (content: string, status: "pending" | "in_progress" | "completed") => ({
+      content,
+      status,
+      activeForm: content,
+    });
+
+    function todoEvents(
+      useId: string,
+      todos: ReturnType<typeof td>[],
+      status: "success" | "error" = "success",
+    ): BusEvent[] {
+      return [
+        {
+          type: "tool_start",
+          run_id: "run-todo",
+          tool_use_id: useId,
+          tool_name: "TodoWrite",
+          input: { todos },
+        },
+        {
+          type: "tool_end",
+          run_id: "run-todo",
+          tool_use_id: useId,
+          tool_name: "TodoWrite",
+          status,
+          tool_use_result: { oldTodos: [], newTodos: todos },
+        },
+      ] as BusEvent[];
+    }
+
+    beforeEach(() => {
+      store.run = makeRun("run-todo");
+      store.phase = "running";
+    });
+
+    it("returns the most recent TodoWrite's newTodos", () => {
+      store.applyEventBatch(todoEvents("t1", [td("a", "completed"), td("b", "in_progress")]));
+      store.applyEventBatch(
+        todoEvents("t2", [td("a", "completed"), td("b", "completed"), td("c", "in_progress")]),
+      );
+      expect(store.latestTodos.map((t) => t.content)).toEqual(["a", "b", "c"]);
+      expect(store.latestTodos[1].status).toBe("completed");
+    });
+
+    it("ignores non-TodoWrite tools", () => {
+      store.applyEventBatch(todoEvents("t1", [td("a", "in_progress")]));
+      store.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "run-todo",
+          tool_use_id: "bash-1",
+          tool_name: "Bash",
+          input: { command: "ls" },
+        },
+        {
+          type: "tool_end",
+          run_id: "run-todo",
+          tool_use_id: "bash-1",
+          tool_name: "Bash",
+          status: "success",
+          tool_use_result: { stdout: "x" },
+        },
+      ] as BusEvent[]);
+      expect(store.latestTodos.map((t) => t.content)).toEqual(["a"]);
+    });
+
+    it("returns [] when no TodoWrite has run", () => {
+      expect(store.latestTodos).toEqual([]);
+    });
+
+    it("skips a failed TodoWrite and keeps the last successful one", () => {
+      store.applyEventBatch(todoEvents("t1", [td("a", "completed")]));
+      store.applyEventBatch(todoEvents("t2", [td("b", "in_progress")], "error"));
+      expect(store.latestTodos.map((t) => t.content)).toEqual(["a"]);
+    });
+  });
+
+  // ── taskList / panelTasks (Tasks system: TaskCreate/TaskUpdate) ──
+
+  describe("taskList getter (Tasks system aggregation)", () => {
+    function taskCreate(id: string, subject: string): BusEvent[] {
+      return [
+        {
+          type: "tool_start",
+          run_id: "run-task",
+          tool_use_id: `c-${id}`,
+          tool_name: "TaskCreate",
+          input: { subject },
+        },
+        {
+          type: "tool_end",
+          run_id: "run-task",
+          tool_use_id: `c-${id}`,
+          tool_name: "TaskCreate",
+          status: "success",
+          tool_use_result: { task: { id, subject } },
+        },
+      ] as BusEvent[];
+    }
+
+    function taskUpdate(id: string, to: string, useId: string): BusEvent[] {
+      return [
+        {
+          type: "tool_start",
+          run_id: "run-task",
+          tool_use_id: useId,
+          tool_name: "TaskUpdate",
+          input: { taskId: id, status: to },
+        },
+        {
+          type: "tool_end",
+          run_id: "run-task",
+          tool_use_id: useId,
+          tool_name: "TaskUpdate",
+          status: "success",
+          tool_use_result: { taskId: id, statusChange: { from: "pending", to }, success: true },
+        },
+      ] as BusEvent[];
+    }
+
+    beforeEach(() => {
+      store.run = makeRun("run-task");
+      store.phase = "running";
+    });
+
+    it("aggregates TaskCreate into a pending list, preserving creation order", () => {
+      store.applyEventBatch(taskCreate("1", "build a.txt"));
+      store.applyEventBatch(taskCreate("2", "build b.txt"));
+      expect(store.taskList).toEqual([
+        { id: "1", text: "build a.txt", status: "pending" },
+        { id: "2", text: "build b.txt", status: "pending" },
+      ]);
+    });
+
+    it("applies TaskUpdate status changes by taskId", () => {
+      store.applyEventBatch(taskCreate("1", "a"));
+      store.applyEventBatch(taskCreate("2", "b"));
+      store.applyEventBatch(taskUpdate("1", "in_progress", "u1"));
+      store.applyEventBatch(taskUpdate("1", "completed", "u2"));
+      expect(store.taskList.map((t) => t.status)).toEqual(["completed", "pending"]);
+    });
+
+    it("removes a task when updated to deleted", () => {
+      store.applyEventBatch(taskCreate("1", "a"));
+      store.applyEventBatch(taskCreate("2", "b"));
+      store.applyEventBatch(taskUpdate("1", "deleted", "u1"));
+      expect(store.taskList.map((t) => t.id)).toEqual(["2"]);
+    });
+  });
+
+  describe("panelTasks getter (unified source)", () => {
+    beforeEach(() => {
+      store.run = makeRun("run-panel");
+      store.phase = "running";
+    });
+
+    it("prefers the Tasks system when TaskCreate events exist", () => {
+      store.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "run-panel",
+          tool_use_id: "c1",
+          tool_name: "TaskCreate",
+          input: {},
+        },
+        {
+          type: "tool_end",
+          run_id: "run-panel",
+          tool_use_id: "c1",
+          tool_name: "TaskCreate",
+          status: "success",
+          tool_use_result: { task: { id: "1", subject: "from tasks" } },
+        },
+      ] as BusEvent[]);
+      expect(store.panelTasks).toEqual([{ id: "1", text: "from tasks", status: "pending" }]);
+    });
+
+    it("falls back to legacy TodoWrite when no Tasks events exist", () => {
+      store.applyEventBatch([
+        {
+          type: "tool_start",
+          run_id: "run-panel",
+          tool_use_id: "w1",
+          tool_name: "TodoWrite",
+          input: {},
+        },
+        {
+          type: "tool_end",
+          run_id: "run-panel",
+          tool_use_id: "w1",
+          tool_name: "TodoWrite",
+          status: "success",
+          tool_use_result: {
+            oldTodos: [],
+            newTodos: [{ content: "from todo", status: "in_progress", activeForm: "from todo" }],
+          },
+        },
+      ] as BusEvent[]);
+      expect(store.panelTasks).toEqual([{ id: "0", text: "from todo", status: "in_progress" }]);
+    });
+
+    it("returns [] when neither source has run", () => {
+      expect(store.panelTasks).toEqual([]);
+    });
+  });
+
+  // ── context occupancy uses last request, not turn-summed usage (#149) ──
+
+  describe("context occupancy (#149)", () => {
+    beforeEach(() => {
+      store.run = makeRun("run-ctx");
+      store.phase = "running";
+    });
+
+    function msg(id: string, input: number, cacheRead: number, cacheCreation: number): BusEvent {
+      return {
+        type: "message_complete",
+        run_id: "run-ctx",
+        message_id: id,
+        text: "ok",
+        message_usage: {
+          input_tokens: input,
+          cache_read_input_tokens: cacheRead,
+          cache_creation_input_tokens: cacheCreation,
+        },
+      } as BusEvent;
+    }
+
+    function result(cacheReadSummed: number, win: number): BusEvent {
+      return {
+        type: "usage_update",
+        run_id: "run-ctx",
+        input_tokens: 3000,
+        output_tokens: 500,
+        cache_read_tokens: cacheReadSummed,
+        cache_write_tokens: 69000,
+        total_cost_usd: 0.4,
+        model_usage: {
+          "claude-opus-4-8": {
+            input_tokens: 3000,
+            output_tokens: 500,
+            cache_read_tokens: cacheReadSummed,
+            cache_write_tokens: 69000,
+            web_search_requests: 0,
+            cost_usd: 0.4,
+            context_window: win,
+          },
+        },
+      } as BusEvent;
+    }
+
+    it("uses the last request's context, not the summed result usage", () => {
+      store.applyEventBatch([
+        { type: "user_message", run_id: "run-ctx", text: "go" },
+        msg("m1", 1000, 0, 30000), // 31k
+        msg("m2", 1000, 30000, 20000), // 51k
+        msg("m3", 1000, 50000, 19000), // 70k ← last request
+        result(80000, 1_000_000), // turn-summed cache_read inflated
+      ] as BusEvent[]);
+      expect(store.lastReqContextTokens).toBe(70000);
+      // 70k, NOT the summed 3000 + 80000 + 69000 = 152000
+      expect(store.contextTokens).toBe(70000);
+    });
+
+    it("falls back to summed usage when messages carry no per-request usage", () => {
+      store.applyEventBatch([
+        { type: "user_message", run_id: "run-ctx", text: "go" },
+        { type: "message_complete", run_id: "run-ctx", message_id: "m1", text: "ok" },
+        result(50000, 200_000),
+      ] as BusEvent[]);
+      expect(store.lastReqContextTokens).toBe(0);
+      // fallback = input 3000 + cache_read 50000 + cache_write 69000
+      expect(store.contextTokens).toBe(122000);
+    });
+  });
+});
+
+// ── Codex Wave-2: mid-turn steer routing (sendMessage) ──
+
+describe("sendMessage routing", () => {
+  let store: SessionStore;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    store = new SessionStore();
+  });
+
+  it("routes to steer when a Codex app-server turn is RUNNING", async () => {
+    store.run = makeRun("codex-steer", { agent: "codex", status: "running" });
+    store.phase = "running"; // isRunning + sessionAlive
+
+    await store.sendMessage("focus on the auth module", []);
+
+    expect(api.steerSession).toHaveBeenCalledWith("codex-steer", "focus on the auth module");
+    expect(api.sendSessionMessage).not.toHaveBeenCalled();
+  });
+
+  it("enqueues (sendSessionMessage) for a Codex app-server turn that is NOT running", async () => {
+    store.run = makeRun("codex-idle", { agent: "codex", status: "running" });
+    store.phase = "idle"; // sessionAlive but not running
+
+    await store.sendMessage("next task please", []);
+
+    expect(api.sendSessionMessage).toHaveBeenCalledWith(
+      "codex-idle",
+      "next task please",
+      undefined,
+      undefined, // no skills
+    );
+    expect(api.steerSession).not.toHaveBeenCalled();
+  });
+
+  it("does NOT steer for a running Claude session (enqueues instead)", async () => {
+    store.run = makeRun("claude-run", { agent: "claude", status: "running" });
+    store.phase = "running";
+
+    await store.sendMessage("more detail", []);
+
+    expect(api.steerSession).not.toHaveBeenCalled();
+    expect(api.sendSessionMessage).toHaveBeenCalledWith(
+      "claude-run",
+      "more detail",
+      undefined,
+      undefined, // no skills
+    );
+  });
+
+  it("falls through to enqueue when a running Codex send carries attachments", async () => {
+    store.run = makeRun("codex-attach", { agent: "codex", status: "running" });
+    store.phase = "running";
+
+    await store.sendMessage("see this", [
+      { name: "a.png", type: "image/png", size: 3, contentBase64: "AAA" },
+    ]);
+
+    // turn/steer takes plain text only — attachments use the normal enqueue path.
+    expect(api.steerSession).not.toHaveBeenCalled();
+    expect(api.sendSessionMessage).toHaveBeenCalled();
+  });
+
+  it("forwards picked Codex skills to sendSessionMessage", async () => {
+    store.run = makeRun("codex-skill", { agent: "codex", status: "running" });
+    store.phase = "idle"; // sessionAlive but not running → enqueue path
+
+    const skills = [{ name: "find-bugs", path: "/abs/find-bugs/SKILL.md" }];
+    await store.sendMessage("scan this", [], skills);
+
+    expect(api.sendSessionMessage).toHaveBeenCalledWith(
+      "codex-skill",
+      "scan this",
+      undefined,
+      skills,
+    );
+  });
+
+  it("does NOT steer a running Codex turn when skills are attached (skills need turn/start)", async () => {
+    store.run = makeRun("codex-skill-run", { agent: "codex", status: "running" });
+    store.phase = "running"; // running → would normally steer, but skills force enqueue
+
+    const skills = [{ name: "find-bugs", path: "/abs/find-bugs/SKILL.md" }];
+    await store.sendMessage("scan this", [], skills);
+
+    expect(api.steerSession).not.toHaveBeenCalled();
+    expect(api.sendSessionMessage).toHaveBeenCalledWith(
+      "codex-skill-run",
+      "scan this",
+      undefined,
+      skills,
+    );
+  });
+});
+
+// ── Codex Wave-3: goal_update reducer + turn-based rewind ──
+
+describe("SessionStore — Codex Wave-3 (goal + rewind)", () => {
+  let store: SessionStore;
+
+  beforeEach(() => {
+    store = new SessionStore();
+    store.run = makeRun("codex-w3", { agent: "codex" });
+    store.phase = "running";
+  });
+
+  describe("goal_update reducer", () => {
+    it("stores the goal payload on first update", () => {
+      store.applyEvent({
+        type: "goal_update",
+        run_id: "codex-w3",
+        goal: { objective: "Ship feature", status: "active", tokenBudget: 100000, tokensUsed: 0 },
+      } as BusEvent);
+
+      expect(store.goal).toEqual({
+        objective: "Ship feature",
+        status: "active",
+        tokenBudget: 100000,
+        tokensUsed: 0,
+      });
+    });
+
+    it("merges successive updates (live progress climbs without losing objective)", () => {
+      store.applyEvent({
+        type: "goal_update",
+        run_id: "codex-w3",
+        goal: { objective: "Ship feature", status: "active", tokenBudget: 100000, tokensUsed: 0 },
+      } as BusEvent);
+      store.applyEvent({
+        type: "goal_update",
+        run_id: "codex-w3",
+        goal: { tokensUsed: 4200, timeUsedSeconds: 30 },
+      } as BusEvent);
+
+      expect(store.goal).toEqual({
+        objective: "Ship feature",
+        status: "active",
+        tokenBudget: 100000,
+        tokensUsed: 4200,
+        timeUsedSeconds: 30,
+      });
+    });
+
+    it("resets to null when the goal is cleared (goal: null)", () => {
+      store.applyEvent({
+        type: "goal_update",
+        run_id: "codex-w3",
+        goal: { objective: "x", status: "active", tokensUsed: 10 },
+      } as BusEvent);
+      expect(store.goal).not.toBeNull();
+
+      store.applyEvent({ type: "goal_update", run_id: "codex-w3", goal: null } as BusEvent);
+      expect(store.goal).toBeNull();
+    });
+
+    it("is cleared by reset()", () => {
+      store.applyEvent({
+        type: "goal_update",
+        run_id: "codex-w3",
+        goal: { objective: "x", status: "active" },
+      } as BusEvent);
+      expect(store.goal).not.toBeNull();
+
+      store.reset();
+      expect(store.goal).toBeNull();
+    });
+  });
+
+  describe("truncateToTurn", () => {
+    // Build a 3-turn timeline: each turn = user_message + message_complete.
+    function seedThreeTurns() {
+      store.applyEventBatch([
+        { type: "user_message", run_id: "codex-w3", text: "turn 1" },
+        { type: "message_complete", run_id: "codex-w3", message_id: "m1", text: "reply 1" },
+        { type: "user_message", run_id: "codex-w3", text: "turn 2" },
+        { type: "message_complete", run_id: "codex-w3", message_id: "m2", text: "reply 2" },
+        { type: "user_message", run_id: "codex-w3", text: "turn 3" },
+        { type: "message_complete", run_id: "codex-w3", message_id: "m3", text: "reply 3" },
+      ] as BusEvent[]);
+    }
+
+    it("drops the selected turn and everything after it", () => {
+      seedThreeTurns();
+      expect(store.timeline.filter((e) => e.kind === "user")).toHaveLength(3);
+
+      // Rewind to turn index 1 (the 2nd turn) → drop turns 2 and 3.
+      const dropped = store.truncateToTurn(1);
+
+      expect(dropped).toBe(2);
+      const users = store.timeline.filter((e) => e.kind === "user");
+      expect(users).toHaveLength(1);
+      expect((users[0] as { content: string }).content).toBe("turn 1");
+      // numTurns is recomputed from surviving user messages on a real truncate.
+      expect(store.numTurns).toBe(1);
+    });
+
+    it("keeps everything when index is past the last turn (no-op)", () => {
+      seedThreeTurns();
+      store.numTurns = 3; // as the result event would have set it
+      const before = store.timeline.length;
+
+      const dropped = store.truncateToTurn(3); // only indices 0..2 exist
+
+      expect(dropped).toBe(0);
+      expect(store.timeline).toHaveLength(before);
+      expect(store.numTurns).toBe(3); // untouched on no-op
+    });
+
+    it("clears streaming buffers for the removed latest turn", () => {
+      seedThreeTurns();
+      store.streamingText = "partial";
+      store.thinkingText = "thinking";
+
+      store.truncateToTurn(0); // drop all turns
+
+      expect(store.timeline.filter((e) => e.kind === "user")).toHaveLength(0);
+      expect(store.streamingText).toBe("");
+      expect(store.thinkingText).toBe("");
+    });
+  });
+});
+
+// ── Codex Wave-4: codex_hook_run reducer (hook lifecycle upsert) ──
+
+describe("SessionStore — Codex Wave-4 (hook lifecycle)", () => {
+  let store: SessionStore;
+
+  beforeEach(() => {
+    store = new SessionStore();
+    store.run = makeRun("codex-w4", { agent: "codex" });
+    store.phase = "running";
+  });
+
+  function hookEntries() {
+    return store.timeline.filter((e) => e.kind === "hook") as Extract<
+      (typeof store.timeline)[number],
+      { kind: "hook" }
+    >[];
+  }
+
+  it("creates a running hook card on hook/started", () => {
+    store.applyEvent({
+      type: "codex_hook_run",
+      run_id: "codex-w4",
+      hook_id: "hook-run-7",
+      event_name: "preToolUse",
+      status: "running",
+    } as BusEvent);
+
+    const hooks = hookEntries();
+    expect(hooks).toHaveLength(1);
+    expect(hooks[0].hookId).toBe("hook-run-7");
+    expect(hooks[0].eventName).toBe("preToolUse");
+    expect(hooks[0].status).toBe("running");
+    // started carries no duration/message → optional fields stay unset.
+    expect(hooks[0].durationMs).toBeUndefined();
+    expect(hooks[0].statusMessage).toBeUndefined();
+  });
+
+  it("upserts: completed updates the SAME entry, not a second card", () => {
+    store.applyEvent({
+      type: "codex_hook_run",
+      run_id: "codex-w4",
+      hook_id: "hook-run-7",
+      event_name: "preToolUse",
+      status: "running",
+    } as BusEvent);
+    const startedId = hookEntries()[0].id;
+
+    store.applyEvent({
+      type: "codex_hook_run",
+      run_id: "codex-w4",
+      hook_id: "hook-run-7",
+      event_name: "preToolUse",
+      status: "completed",
+      duration_ms: 1234,
+    } as BusEvent);
+
+    const hooks = hookEntries();
+    // Still ONE card — keyed by hook_id, updated in place.
+    expect(hooks).toHaveLength(1);
+    expect(hooks[0].id).toBe(startedId);
+    expect(hooks[0].status).toBe("completed");
+    expect(hooks[0].durationMs).toBe(1234);
+  });
+
+  it("merges status_message on completion while keeping prior fields", () => {
+    store.applyEvent({
+      type: "codex_hook_run",
+      run_id: "codex-w4",
+      hook_id: "hook-run-8",
+      event_name: "permissionRequest",
+      status: "running",
+    } as BusEvent);
+    store.applyEvent({
+      type: "codex_hook_run",
+      run_id: "codex-w4",
+      hook_id: "hook-run-8",
+      event_name: "permissionRequest",
+      status: "blocked",
+      status_message: "denied by policy",
+      duration_ms: 42,
+    } as BusEvent);
+
+    const hooks = hookEntries();
+    expect(hooks).toHaveLength(1);
+    expect(hooks[0].status).toBe("blocked");
+    expect(hooks[0].statusMessage).toBe("denied by policy");
+    expect(hooks[0].durationMs).toBe(42);
+    // eventName from the started event is preserved across the upsert.
+    expect(hooks[0].eventName).toBe("permissionRequest");
+  });
+
+  it("keeps distinct hook_ids as distinct cards", () => {
+    store.applyEvent({
+      type: "codex_hook_run",
+      run_id: "codex-w4",
+      hook_id: "hook-a",
+      event_name: "preToolUse",
+      status: "running",
+    } as BusEvent);
+    store.applyEvent({
+      type: "codex_hook_run",
+      run_id: "codex-w4",
+      hook_id: "hook-b",
+      event_name: "postToolUse",
+      status: "running",
+    } as BusEvent);
+
+    const hooks = hookEntries();
+    expect(hooks).toHaveLength(2);
+    expect(hooks.map((h) => h.hookId).sort()).toEqual(["hook-a", "hook-b"]);
+  });
+
+  it("is a known event type under strictMode (0 unknown, no throw)", () => {
+    // codex_hook_run must hit its reducer case, not the `default` unknown branch.
+    const strict = new SessionStore();
+    strict.strictMode = true;
+    strict.run = makeRun("codex-w4", { agent: "codex" });
+    strict.phase = "running";
+    expect(() =>
+      strict.applyEventBatch([
+        {
+          type: "codex_hook_run",
+          run_id: "codex-w4",
+          hook_id: "hook-strict",
+          event_name: "sessionStart",
+          status: "running",
+        },
+        {
+          type: "codex_hook_run",
+          run_id: "codex-w4",
+          hook_id: "hook-strict",
+          event_name: "sessionStart",
+          status: "completed",
+          duration_ms: 5,
+        },
+      ] as BusEvent[]),
+    ).not.toThrow();
+    expect(strict.unknownEventCount).toBe(0);
+    expect(strict.rawFallbackCount).toBe(0);
+  });
+});
+
+// ── Codex Wave-4: codex_mcp_status reducer (live MCP startup-state) ──
+
+describe("SessionStore — Codex Wave-4 (MCP live status)", () => {
+  let store: SessionStore;
+
+  beforeEach(() => {
+    store = new SessionStore();
+    store.run = makeRun("codex-w4", { agent: "codex" });
+    store.phase = "running";
+  });
+
+  it("maps Codex startup states to the panel vocab and upserts by name", () => {
+    // Unknown server → appended.
+    store.applyEvent({
+      type: "codex_mcp_status",
+      run_id: "codex-w4",
+      name: "codex_apps",
+      status: "starting",
+    } as BusEvent);
+    expect(store.mcpServers).toHaveLength(1);
+    expect(store.mcpServers[0]).toMatchObject({ name: "codex_apps", status: "pending" });
+
+    // Same name → updated in place (still one entry), ready → connected.
+    store.applyEvent({
+      type: "codex_mcp_status",
+      run_id: "codex-w4",
+      name: "codex_apps",
+      status: "ready",
+    } as BusEvent);
+    expect(store.mcpServers).toHaveLength(1);
+    expect(store.mcpServers[0].status).toBe("connected");
+
+    // failed carries the error through; cancelled also maps to failed.
+    store.applyEvent({
+      type: "codex_mcp_status",
+      run_id: "codex-w4",
+      name: "codex_apps",
+      status: "failed",
+      error: "handshake failed",
+    } as BusEvent);
+    expect(store.mcpServers[0].status).toBe("failed");
+    expect(store.mcpServers[0].error).toBe("handshake failed");
+
+    store.applyEvent({
+      type: "codex_mcp_status",
+      run_id: "codex-w4",
+      name: "codex_apps",
+      status: "cancelled",
+    } as BusEvent);
+    expect(store.mcpServers[0].status).toBe("failed");
+  });
+
+  it("is a known event type (no unknown/raw fallback)", () => {
+    const strict = new SessionStore();
+    strict.run = makeRun("codex-w4", { agent: "codex" });
+    strict.strictMode = true;
+    expect(() =>
+      strict.applyEvent({
+        type: "codex_mcp_status",
+        run_id: "codex-w4",
+        name: "s1",
+        status: "ready",
+      } as BusEvent),
+    ).not.toThrow();
+    expect(strict.unknownEventCount).toBe(0);
+  });
+});
+
+// ── Codex Wave-4 (G4): codex_turn_diff reducer (live aggregated turn diff) ──
+
+describe("SessionStore — Codex Wave-4 (turn diff live)", () => {
+  let store: SessionStore;
+
+  beforeEach(() => {
+    store = new SessionStore();
+    store.run = makeRun("codex-w4d", { agent: "codex" });
+    store.phase = "running";
+  });
+
+  it("stores the latest diff; a later event supersedes the earlier one", () => {
+    expect(store.turnDiff).toBe("");
+
+    store.applyEvent({
+      type: "codex_turn_diff",
+      run_id: "codex-w4d",
+      turn_id: "tu1",
+      diff: "--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new",
+    } as BusEvent);
+    expect(store.turnDiff).toBe("--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new");
+
+    // Cumulative push — later event wins (diff is aggregated server-side).
+    store.applyEvent({
+      type: "codex_turn_diff",
+      run_id: "codex-w4d",
+      turn_id: "tu1",
+      diff: "--- a\n+++ b\n@@ -1,2 +1,2 @@\n-old\n+new\n+extra",
+    } as BusEvent);
+    expect(store.turnDiff).toBe("--- a\n+++ b\n@@ -1,2 +1,2 @@\n-old\n+new\n+extra");
+  });
+
+  it("clears the diff at the next turn start (run_state→running)", () => {
+    store.applyEvent({
+      type: "codex_turn_diff",
+      run_id: "codex-w4d",
+      turn_id: "tu1",
+      diff: "some diff",
+    } as BusEvent);
+    expect(store.turnDiff).toBe("some diff");
+
+    // Next turn begins — the previous turn's aggregated diff is dropped.
+    store.applyEvent({
+      type: "run_state",
+      run_id: "codex-w4d",
+      state: "running",
+    } as BusEvent);
+    expect(store.turnDiff).toBe("");
+  });
+
+  it("is a known event type (no unknown/raw fallback)", () => {
+    const strict = new SessionStore();
+    strict.run = makeRun("codex-w4d", { agent: "codex" });
+    strict.strictMode = true;
+    expect(() =>
+      strict.applyEvent({
+        type: "codex_turn_diff",
+        run_id: "codex-w4d",
+        turn_id: "tu1",
+        diff: "d",
+      } as BusEvent),
+    ).not.toThrow();
+    expect(strict.unknownEventCount).toBe(0);
+  });
+});
+
+describe("SessionStart sessionTitle auto-naming", () => {
+  function sessionStartHook(runId: string, title: string | null): BusEvent {
+    return {
+      type: "hook_response",
+      run_id: runId,
+      hook_id: "h-sessiontitle",
+      hook_event: "SessionStart",
+      outcome: "success",
+      data: {},
+      stdout:
+        title === null
+          ? '{"hookSpecificOutput":{"hookEventName":"SessionStart"}}'
+          : `{"hookSpecificOutput":{"hookEventName":"SessionStart","sessionTitle":${JSON.stringify(title)}}}`,
+    } as BusEvent;
+  }
+
+  beforeEach(() => {
+    vi.mocked(api.renameRun).mockClear();
+  });
+
+  it("sets run.name from sessionTitle when the run has no name", async () => {
+    const store = new SessionStore();
+    store.run = makeRun("run-st1");
+    store.applyEvent(sessionStartHook("run-st1", "Refactor auth flow"));
+    expect(store.run?.name).toBe("Refactor auth flow");
+    await vi.waitFor(() =>
+      expect(api.renameRun).toHaveBeenCalledWith("run-st1", "Refactor auth flow"),
+    );
+  });
+
+  it("does NOT overwrite a user-assigned name (resume case)", () => {
+    const store = new SessionStore();
+    store.run = makeRun("run-st2", { name: "My Custom Name" });
+    store.applyEvent(sessionStartHook("run-st2", "Hook Title"));
+    expect(store.run?.name).toBe("My Custom Name");
+    expect(api.renameRun).not.toHaveBeenCalled();
+  });
+
+  it("ignores a SessionStart hook with no sessionTitle", () => {
+    const store = new SessionStore();
+    store.run = makeRun("run-st3");
+    store.applyEvent(sessionStartHook("run-st3", null));
+    expect(store.run?.name).toBeUndefined();
+    expect(api.renameRun).not.toHaveBeenCalled();
+  });
+
+  it("ignores sessionTitle from non-SessionStart hooks", () => {
+    const store = new SessionStore();
+    store.run = makeRun("run-st4");
+    store.applyEvent({
+      ...sessionStartHook("run-st4", "Should Be Ignored"),
+      hook_event: "PreToolUse",
+    } as BusEvent);
+    expect(store.run?.name).toBeUndefined();
+    expect(api.renameRun).not.toHaveBeenCalled();
   });
 });

@@ -1,14 +1,32 @@
+use crate::agent::claude_stream::{augmented_path, which_binary};
 use crate::agent::pipe_parser::{CodexStdoutParser, PipeStdoutParser};
-use crate::models::{ChatDelta, ChatDone, RunEventType};
+use crate::models::{BusEvent, ChatDelta, ChatDone, RunEventType};
 use crate::process_ext::HideConsole;
 use crate::storage;
+use crate::web_server::broadcaster::BroadcastEmitter;
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+
+// Inactivity guard for the Codex pipe-exec stdout loop: if the process is alive
+// but emits no NDJSON line for this long, treat it as hung and kill it. Generous
+// (matches the stream-json USER_HARD_TIMEOUT magnitude) so long legitimate turns —
+// including silent multi-minute command executions — are not falsely killed.
+const CODEX_IDLE_TIMEOUT: Duration = Duration::from_secs(1800); // 30 min
+
+/// Codex writes benign informational banners to stderr on every spawn (e.g. when reading
+/// the prompt from stdin). These are not errors and must not surface as timeline cards.
+/// Kept as a tight allowlist so real Codex errors still render.
+fn is_benign_codex_stderr(line: &str) -> bool {
+    let t = line.trim();
+    t.is_empty() || t == "Reading additional input from stdin..."
+}
 
 pub type ProcessMap = Arc<Mutex<HashMap<String, Child>>>;
 
@@ -71,6 +89,7 @@ fn decode_utf8_chunk(leftover: Vec<u8>, chunk: &[u8]) -> (String, Vec<u8>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent(
     app: AppHandle,
     process_map: ProcessMap,
@@ -79,14 +98,17 @@ pub async fn run_agent(
     args: Vec<String>,
     cwd: String,
     agent: String,
+    emitter: Option<Arc<BroadcastEmitter>>,
+    extra_env: HashMap<String, String>,
 ) -> Result<(), String> {
     log::debug!(
-        "[stream] run_agent: run_id={}, cmd={}, args={:?}, cwd={}, agent={}",
+        "[stream] run_agent: run_id={}, cmd={}, args={:?}, cwd={}, agent={}, has_emitter={}",
         run_id,
         command,
         args,
         cwd,
-        agent
+        agent,
+        emitter.is_some()
     );
 
     let emit_run_event = |rt: RunEventType, payload: serde_json::Value| {
@@ -99,6 +121,15 @@ pub async fn run_agent(
         }
     };
 
+    // Pre-compute process_seq BEFORE spawning the child process.
+    // If this fails, we return Err without having spawned anything — no leak.
+    let is_codex = agent == "codex";
+    let process_seq: u32 = if is_codex && emitter.is_some() {
+        storage::runs::next_codex_process_seq(&run_id)?
+    } else {
+        0
+    };
+
     // Log start
     emit_run_event(
         RunEventType::System,
@@ -108,30 +139,57 @@ pub async fn run_agent(
         }),
     );
 
-    let mut child = Command::new(&command)
-        .args(&args)
+    // Resolve the binary to an absolute path via the augmented PATH (nvm/brew/.local/bin).
+    // The Tauri process can inherit a sparse PATH (e.g. launched from Finder/Dock), so a
+    // bare `codex`/`claude` name would ENOENT. Fall back to the bare name if unresolved
+    // (preserves prior behavior). Also inject the augmented PATH into the child so the CLI's
+    // own subprocess lookups succeed.
+    let resolved = if std::path::Path::new(&command).is_absolute() {
+        command.clone()
+    } else if is_codex {
+        // Codex needs the candidate-list resolver (npm codex.cmd on Windows) — a bare
+        // which_binary miss would fall back to "codex" and ENOENT on Windows.
+        crate::agent::claude_stream::resolve_codex_path()
+    } else {
+        which_binary(&command).unwrap_or_else(|| command.clone())
+    };
+    let path_env = augmented_path();
+
+    let mut cmd = Command::new(&resolved);
+    cmd.args(&args)
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .env("PATH", &path_env)
         .env("OPENCOVIBE_TASK_ID", &run_id)
         .env("OPENCOVIBE_RUN_ID", &run_id)
         .env_remove("CLAUDECODE") // Allow running inside a Claude Code session
         .hide_console()
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| {
-            let msg = if e.kind() == std::io::ErrorKind::NotFound {
-                format!(
-                    "Command \"{}\" not found. Is {} CLI installed and in your PATH?",
-                    command, agent
-                )
-            } else {
-                e.to_string()
-            };
-            log::error!("[stream] spawn failed: {}", msg);
-            msg
-        })?;
+        .kill_on_drop(true);
+    // Codex ignores Anthropic auth vars, but clear them defensively so an inherited
+    // shell ANTHROPIC_* cannot interfere (mirrors the auth mutual-exclusion in HC#4).
+    if is_codex {
+        cmd.env_remove("ANTHROPIC_API_KEY");
+        cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
+    }
+    // Provider-specific env (e.g. a Codex third-party provider's env_key=api_key). Set last so
+    // it wins over inherited values.
+    for (k, v) in &extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().map_err(|e| {
+        let msg = if e.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "Command \"{}\" not found. Is {} CLI installed and in your PATH?",
+                command, agent
+            )
+        } else {
+            e.to_string()
+        };
+        log::error!("[stream] spawn failed: {}", msg);
+        msg
+    })?;
 
     let pid = child.id().unwrap_or(0);
     log::debug!("[stream] spawned process: run_id={}, pid={}", run_id, pid);
@@ -148,18 +206,46 @@ pub async fn run_agent(
     let run_id_out = run_id.clone();
     let run_id_err = run_id.clone();
     let app_out = app.clone();
-    let agent_clone = agent.clone();
+    let emitter_out = emitter.clone();
+
+    // Idle-timeout machinery for the Codex stdout loop (see CODEX_IDLE_TIMEOUT).
+    // On timeout the stdout task itself removes+kills the child via the process map,
+    // and sets this flag so the wait() below can distinguish timeout from a user stop.
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let timed_out_out = timed_out.clone();
+    let pm_kill = process_map.clone();
+    let run_id_kill = run_id.clone();
 
     // Stdout reader
     let stdout_handle = tokio::spawn(async move {
         let mut assistant_text = String::new();
-        let is_codex = agent_clone == "codex";
 
         if is_codex {
-            let mut parser = CodexStdoutParser;
+            let mut parser = CodexStdoutParser::new(process_seq);
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            loop {
+                let line = match tokio::time::timeout(CODEX_IDLE_TIMEOUT, lines.next_line()).await {
+                    Ok(Ok(Some(line))) => line,
+                    Ok(Ok(None)) => break, // EOF: process closed stdout normally
+                    Ok(Err(e)) => {
+                        log::warn!("[stream] codex stdout read error: {}", e);
+                        break;
+                    }
+                    Err(_) => {
+                        // Idle timeout: process alive but silent → assume hung, kill it.
+                        log::error!(
+                            "[stream] codex idle timeout: no stdout for {}s, killing run_id={}",
+                            CODEX_IDLE_TIMEOUT.as_secs(),
+                            run_id_kill
+                        );
+                        timed_out_out.store(true, Ordering::SeqCst);
+                        if let Some(mut child) = pm_kill.lock().await.remove(&run_id_kill) {
+                            let _ = child.start_kill();
+                        }
+                        break;
+                    }
+                };
                 if let Err(e) = storage::events::append_event(
                     &run_id_out,
                     RunEventType::Stdout,
@@ -201,7 +287,12 @@ pub async fn run_agent(
                     // Use PipeStdoutParser trait for structured event → BusEvent
                     let events = parser.parse_line(&run_id_out, &payload);
                     for ev in &events {
-                        if let crate::models::BusEvent::MessageDelta { text, .. } = ev {
+                        // Emit via BroadcastEmitter if available (Phase 2 structured path)
+                        if let Some(ref em) = emitter_out {
+                            em.persist_and_emit(&run_id_out, ev);
+                        }
+                        // Also emit chat-delta for backward compatibility (terminal view)
+                        if let BusEvent::MessageComplete { text, .. } = ev {
                             assistant_text.push_str(text);
                             let _ = app_out.emit("chat-delta", ChatDelta { text: text.clone() });
                         }
@@ -250,6 +341,7 @@ pub async fn run_agent(
 
     // Stderr reader
     let app_err = app.clone();
+    let emitter_err = emitter.clone();
     let stderr_handle = tokio::spawn(async move {
         let mut stderr_text = String::new();
         let reader = BufReader::new(stderr);
@@ -272,6 +364,20 @@ pub async fn run_agent(
                     "text": line
                 }),
             );
+            // Emit stderr as CommandOutput via bus — but skip Codex's benign per-spawn
+            // banner so it doesn't show up as a junk timeline card on every run.
+            // (Still appended to events.jsonl + run-event above for raw-log visibility.)
+            if !(is_codex && is_benign_codex_stderr(&line)) {
+                if let Some(ref em) = emitter_err {
+                    em.persist_and_emit(
+                        &run_id_err,
+                        &BusEvent::CommandOutput {
+                            run_id: run_id_err.clone(),
+                            content: format!("[stderr] {}", line),
+                        },
+                    );
+                }
+            }
         }
         stderr_text
     });
@@ -287,15 +393,23 @@ pub async fn run_agent(
         let mut map = process_map.lock().await;
         map.remove(&run_id)
     };
+    // -2 = killed by the idle-timeout guard, -1 = killed by stop_run. The stdout task
+    // already removed+killed the child on timeout, so removed_child is None in both cases;
+    // the timed_out flag disambiguates so we report Failed (not Stopped) for a hang.
     let exit_code = if let Some(mut child) = removed_child {
         match child.wait().await {
             Ok(status) => status.code().unwrap_or(1),
             Err(_) => 1,
         }
+    } else if timed_out.load(Ordering::SeqCst) {
+        -2
     } else {
-        // Was killed by stop_run
         -1
     };
+    let timeout_msg = format!(
+        "Codex timed out: no output for {}s",
+        CODEX_IDLE_TIMEOUT.as_secs()
+    );
 
     // Save assistant event
     if !assistant_text.trim().is_empty() {
@@ -331,6 +445,18 @@ pub async fn run_agent(
         ) {
             log::warn!("[stream] failed to update status to Stopped: {}", e);
         }
+    } else if exit_code == -2 {
+        if let Err(e) = storage::runs::update_status(
+            &run_id,
+            crate::models::RunStatus::Failed,
+            None,
+            Some(timeout_msg.clone()),
+        ) {
+            log::warn!(
+                "[stream] failed to update status to Failed (timeout): {}",
+                e
+            );
+        }
     } else if let Err(e) = storage::runs::update_status(
         &run_id,
         crate::models::RunStatus::Failed,
@@ -338,6 +464,35 @@ pub async fn run_agent(
         Some(format!("Exit code {}", exit_code)),
     ) {
         log::warn!("[stream] failed to update status to Failed: {}", e);
+    }
+
+    // Emit RunState via bus
+    if let Some(ref em) = emitter {
+        // For resumable Codex runs (has conversation_ref), normal exit → "idle"
+        // instead of "completed", so the UI shows the same state as Claude between turns.
+        let has_conversation_ref = is_codex
+            && storage::runs::get_run(&run_id)
+                .map(|r| r.conversation_ref.is_some())
+                .unwrap_or(false);
+        let state = match exit_code {
+            0 if has_conversation_ref => "idle",
+            0 => "completed",
+            -1 => "stopped",
+            _ => "failed",
+        };
+        em.persist_and_emit(
+            &run_id,
+            &BusEvent::RunState {
+                run_id: run_id.clone(),
+                state: state.to_string(),
+                exit_code: Some(exit_code),
+                error: match exit_code {
+                    -2 => Some(timeout_msg.clone()),
+                    c if c != 0 && c != -1 => Some(format!("Exit code {}", c)),
+                    _ => None,
+                },
+            },
+        );
     }
 
     emit_run_event(
@@ -457,5 +612,20 @@ pub async fn stop_process(process_map: &ProcessMap, run_id: &str) -> bool {
     } else {
         log::debug!("[stream] stop_process: no process for run_id={}", run_id);
         false
+    }
+}
+
+#[cfg(test)]
+mod stderr_tests {
+    use super::is_benign_codex_stderr;
+
+    #[test]
+    fn benign_codex_stderr_recognized() {
+        assert!(is_benign_codex_stderr(
+            "Reading additional input from stdin..."
+        ));
+        assert!(is_benign_codex_stderr("   ")); // blank lines are benign
+        assert!(!is_benign_codex_stderr("Error: model 'x' is not supported"));
+        assert!(!is_benign_codex_stderr("panic: something broke"));
     }
 }

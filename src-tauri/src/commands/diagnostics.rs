@@ -1,9 +1,10 @@
 use crate::agent::claude_stream::augmented_path;
 use crate::agent::ssh::{expand_local_tilde, shell_escape};
 use crate::models::{
-    ApiTestResult, AuthDiagnostics, ClaudeMdInfo, CliCheckResult, CliDiagnostics, CliDistTags,
-    ConfigDiagnostics, ConfigIssue, DiagnosticsReport, LocalProxyStatus, ProjectDiagnostics,
-    ProjectInitStatus, RemoteTestResult, ServicesDiagnostics, SshKeyInfo, SystemDiagnostics,
+    AgentsMdInfo, ApiTestResult, AuthDiagnostics, ClaudeMdInfo, CliCheckResult, CliDiagnostics,
+    CliDistTags, CodexAuthResult, ConfigDiagnostics, ConfigIssue, DiagnosticsReport,
+    LocalProxyStatus, ProjectDiagnostics, ProjectInitStatus, RemoteTestResult, ServicesDiagnostics,
+    SshKeyInfo, SystemDiagnostics,
 };
 use crate::process_ext::HideConsole;
 use std::path::Path;
@@ -26,9 +27,12 @@ pub async fn check_agent_cli(agent: String) -> Result<CliCheckResult, String> {
         None => (false, None),
     };
 
-    // Get version if found
+    // Get version if found. Spawn the RESOLVED path, not the bare name — on Windows the npm
+    // binary is `codex.cmd`/`claude.cmd` and `Command::new("codex")` only auto-appends `.exe`,
+    // so a bare-name spawn ENOENTs and version/auth would falsely report "not installed".
     let version = if found {
-        let ver_output = Command::new(binary)
+        let exe = path.as_deref().unwrap_or(binary);
+        let ver_output = Command::new(exe)
             .arg("--version")
             .env("PATH", &aug_path)
             .hide_console()
@@ -56,6 +60,165 @@ pub async fn check_agent_cli(agent: String) -> Result<CliCheckResult, String> {
         found,
         path,
         version,
+    })
+}
+
+#[tauri::command]
+pub async fn check_codex_auth() -> Result<CodexAuthResult, String> {
+    log::debug!("[diagnostics] check_codex_auth: starting");
+
+    // Reuse check_agent_cli to detect installation
+    let cli_check = check_agent_cli("codex".to_string()).await?;
+    if !cli_check.found {
+        log::debug!("[diagnostics] check_codex_auth: codex not installed");
+        return Ok(CodexAuthResult {
+            installed: false,
+            version: None,
+            logged_in: false,
+            auth_method: None,
+            status_text: None,
+        });
+    }
+
+    let aug_path = augmented_path();
+    log::debug!(
+        "[diagnostics] check_codex_auth: binary found at {:?}, version={:?}",
+        cli_check.path,
+        cli_check.version
+    );
+
+    // Run `codex login status` to check auth (12s timeout — matches Claude OAuth check).
+    // Spawn the resolved path (cli_check.path), not the bare "codex" — Windows .cmd shim.
+    use tokio::process::Command as TokioCommand;
+    let codex_exe = cli_check.path.as_deref().unwrap_or("codex");
+    let mut cmd = TokioCommand::new(codex_exe);
+    cmd.args(["login", "status"])
+        .env("PATH", &aug_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .hide_console()
+        .kill_on_drop(true);
+
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(12), cmd.output()).await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            log::debug!(
+                "[diagnostics] check_codex_auth: failed to execute 'codex login status': {}",
+                e
+            );
+            return Ok(CodexAuthResult {
+                installed: true,
+                version: cli_check.version,
+                logged_in: false,
+                auth_method: None,
+                status_text: Some(format!("exec error: {}", e)),
+            });
+        }
+        Err(_) => {
+            log::debug!("[diagnostics] check_codex_auth: 'codex login status' timed out (12s)");
+            return Ok(CodexAuthResult {
+                installed: true,
+                version: cli_check.version,
+                logged_in: false,
+                auth_method: None,
+                status_text: Some("timed out (12s)".into()),
+            });
+        }
+    };
+
+    let exit_code = output.status.code();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let logged_in = output.status.success();
+
+    log::debug!(
+        "[diagnostics] check_codex_auth: exit_code={:?}, logged_in={}, stdout={:?}, stderr={:?}",
+        exit_code,
+        logged_in,
+        stdout,
+        stderr
+    );
+
+    let auth_method = if logged_in {
+        let method = if stdout.contains("ChatGPT") {
+            "chatgpt"
+        } else if stdout.contains("API key") {
+            "api_key"
+        } else {
+            "unknown"
+        };
+        log::debug!(
+            "[diagnostics] check_codex_auth: parsed auth_method={:?}",
+            method
+        );
+        Some(method.to_string())
+    } else {
+        log::debug!(
+            "[diagnostics] check_codex_auth: not logged in (exit_code={:?})",
+            exit_code
+        );
+        None
+    };
+
+    log::debug!(
+        "[diagnostics] check_codex_auth result: installed=true, logged_in={}, auth_method={:?}",
+        logged_in,
+        auth_method
+    );
+
+    Ok(CodexAuthResult {
+        installed: true,
+        version: cli_check.version,
+        logged_in,
+        auth_method,
+        status_text: Some(stdout),
+    })
+}
+
+/// Run `codex doctor --json` and return its structured report verbatim for the diagnostics UI.
+/// Shape: `{schemaVersion, generatedAt, overallStatus, codexVersion, checks:{<id>:{id,category,
+/// status,summary,details,remediation,durationMs}}}`. Richer than `codex login status` —
+/// covers install/config/auth/runtime/app-server health. 25s timeout (doctor probes more,
+/// incl. network). Returns Err only when codex is absent / the run can't start / output isn't JSON.
+#[tauri::command]
+pub async fn run_codex_doctor() -> Result<serde_json::Value, String> {
+    log::debug!("[diagnostics] run_codex_doctor: starting");
+    let cli_check = check_agent_cli("codex".to_string()).await?;
+    if !cli_check.found {
+        return Err("Codex CLI not installed".to_string());
+    }
+    let aug_path = augmented_path();
+    let codex_exe = cli_check.path.as_deref().unwrap_or("codex");
+
+    use tokio::process::Command as TokioCommand;
+    let mut cmd = TokioCommand::new(codex_exe);
+    // --no-color: keep JSON clean of ANSI; --json: machine-readable.
+    cmd.args(["doctor", "--json", "--no-color"])
+        .env("PATH", &aug_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .hide_console()
+        .kill_on_drop(true);
+
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(25), cmd.output()).await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(format!("failed to run codex doctor: {}", e)),
+        Err(_) => return Err("codex doctor timed out (25s)".to_string()),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // doctor exits non-zero when overallStatus is fail/warn — that's a valid report, not an error.
+    // Only treat unparseable output as a failure.
+    serde_json::from_str::<serde_json::Value>(stdout.trim()).map_err(|e| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log::warn!("[diagnostics] run_codex_doctor: non-JSON output: {}", e);
+        format!(
+            "codex doctor produced no JSON ({}). stderr: {}",
+            e,
+            stderr.trim()
+        )
     })
 }
 
@@ -517,6 +680,7 @@ pub fn check_project_init(cwd: String) -> Result<ProjectInitStatus, String> {
         return Ok(ProjectInitStatus {
             cwd,
             has_claude_md: false,
+            has_agents_md: false,
         });
     }
     // Canonicalize path (resolve symlinks + normalize case)
@@ -524,14 +688,17 @@ pub fn check_project_init(cwd: String) -> Result<ProjectInitStatus, String> {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| cwd.clone());
     let has_claude_md = root.join("CLAUDE.md").is_file();
+    let has_agents_md = root.join("AGENTS.md").is_file();
     log::debug!(
-        "[diagnostics] check_project_init: canonical={}, has_claude_md={}",
+        "[diagnostics] check_project_init: canonical={}, has_claude_md={}, has_agents_md={}",
         canonical,
-        has_claude_md
+        has_claude_md,
+        has_agents_md
     );
     Ok(ProjectInitStatus {
         cwd: canonical,
         has_claude_md,
+        has_agents_md,
     })
 }
 
@@ -553,12 +720,13 @@ pub async fn run_diagnostics(cwd: String) -> Result<DiagnosticsReport, String> {
     );
 
     // Async checks in parallel
-    let (cli, dist, auth, community, mcp_reg) = tokio::join!(
+    let (cli, dist, auth, community, mcp_reg, codex_auth) = tokio::join!(
         check_cli_inner(),
         fetch_dist_tags_inner(),
         check_auth_inner(),
         check_community_inner(),
         check_mcp_reg_inner(),
+        async { check_codex_auth().await.ok() },
     );
 
     // Merge CLI + dist tags
@@ -570,9 +738,9 @@ pub async fn run_diagnostics(cwd: String) -> Result<DiagnosticsReport, String> {
     };
 
     // Sync checks
-    let home = crate::storage::dirs_next()
-        .map(|h| h.join(".claude"))
-        .unwrap_or_default();
+    let user_home = crate::storage::dirs_next().unwrap_or_default();
+    let home = user_home.join(".claude");
+    let codex_home = user_home.join(".codex");
     let settings_issues = validate_config_files_at(&home, &cwd, has_valid_cwd);
     let keybinding_issues = validate_keybindings_at(&home);
     let mcp_issues = validate_mcp_configs_at(&home, &cwd, has_valid_cwd);
@@ -581,6 +749,8 @@ pub async fn run_diagnostics(cwd: String) -> Result<DiagnosticsReport, String> {
     let has_claude_md = claude_md_files
         .iter()
         .any(|f| f.path.ends_with("CLAUDE.md"));
+    let agents_md_files = scan_agents_md_files_at(&codex_home, &cwd, has_valid_cwd);
+    let has_agents_md = !agents_md_files.is_empty();
     let sandbox = check_sandbox();
     let locks = list_lock_files_at(&home);
 
@@ -609,6 +779,8 @@ pub async fn run_diagnostics(cwd: String) -> Result<DiagnosticsReport, String> {
             cwd: cwd.clone(),
             has_claude_md,
             claude_md_files,
+            has_agents_md,
+            agents_md_files,
             skipped_project_scope: !has_valid_cwd,
         },
         configs: ConfigDiagnostics {
@@ -625,6 +797,7 @@ pub async fn run_diagnostics(cwd: String) -> Result<DiagnosticsReport, String> {
             sandbox_available: sandbox,
             lock_files: locks,
         },
+        codex: codex_auth,
     })
 }
 
@@ -1087,6 +1260,43 @@ fn scan_claude_md_files_at(home: &Path, cwd: &str, has_valid_cwd: bool) -> Vec<C
     files
 }
 
+// ── Sub-check: AGENTS.md files (Codex) ──
+
+fn scan_agents_md_files_at(codex_home: &Path, cwd: &str, has_valid_cwd: bool) -> Vec<AgentsMdInfo> {
+    let mut files = Vec::new();
+
+    // ~/.codex/AGENTS.md
+    let global_path = codex_home.join("AGENTS.md");
+    if let Ok(content) = std::fs::read_to_string(&global_path) {
+        files.push(AgentsMdInfo {
+            path: global_path.display().to_string(),
+            size_chars: content.chars().count(),
+        });
+    }
+
+    if has_valid_cwd {
+        // {cwd}/AGENTS.md
+        let cwd_path = Path::new(cwd).join("AGENTS.md");
+        if let Ok(content) = std::fs::read_to_string(&cwd_path) {
+            files.push(AgentsMdInfo {
+                path: cwd_path.display().to_string(),
+                size_chars: content.chars().count(),
+            });
+        }
+
+        // {cwd}/.codex/AGENTS.md
+        let cwd_dot_path = Path::new(cwd).join(".codex").join("AGENTS.md");
+        if let Ok(content) = std::fs::read_to_string(&cwd_dot_path) {
+            files.push(AgentsMdInfo {
+                path: cwd_dot_path.display().to_string(),
+                size_chars: content.chars().count(),
+            });
+        }
+    }
+
+    files
+}
+
 // ── Sub-check: Sandbox ──
 
 fn check_sandbox() -> Option<bool> {
@@ -1214,6 +1424,49 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].size_chars, 8); // "# Global"
         assert_eq!(files[1].size_chars, 22); // "# Project content here"
+    }
+
+    #[test]
+    fn test_scan_agents_md_files_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex_home = dir.path().join("home_codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::write(codex_home.join("AGENTS.md"), "# Global Codex").unwrap();
+
+        let cwd_dir = dir.path().join("project");
+        let cwd_dotcodex = cwd_dir.join(".codex");
+        std::fs::create_dir_all(&cwd_dotcodex).unwrap();
+        std::fs::write(cwd_dir.join("AGENTS.md"), "# Project root").unwrap();
+        std::fs::write(cwd_dotcodex.join("AGENTS.md"), "# Project dotcodex").unwrap();
+
+        let files = scan_agents_md_files_at(&codex_home, &cwd_dir.to_string_lossy(), true);
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].size_chars, 14); // "# Global Codex"
+        assert_eq!(files[1].size_chars, 14); // "# Project root"
+        assert_eq!(files[2].size_chars, 18); // "# Project dotcodex"
+    }
+
+    #[test]
+    fn test_scan_agents_md_files_at_skips_project_when_invalid_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex_home = dir.path().join("home_codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::write(codex_home.join("AGENTS.md"), "# Global").unwrap();
+
+        let files = scan_agents_md_files_at(&codex_home, "/nonexistent", false);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.ends_with("AGENTS.md"));
+    }
+
+    #[test]
+    fn test_scan_agents_md_files_at_empty_when_none_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = scan_agents_md_files_at(
+            &dir.path().join("nohome"),
+            &dir.path().to_string_lossy(),
+            true,
+        );
+        assert!(files.is_empty());
     }
 
     #[test]

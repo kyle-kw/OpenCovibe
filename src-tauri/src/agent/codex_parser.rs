@@ -1,5 +1,63 @@
 use serde_json::Value;
 
+/// The tool category a Codex item maps to. Shared by both Codex transports — the one-way `exec`
+/// NDJSON parser ([`crate::agent::pipe_parser`], snake_case item types) and the bidirectional
+/// `app-server` driver ([`crate::agent::codex_appserver`], camelCase item types) — so the
+/// item→tool-name decision lives in exactly one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexToolKind {
+    /// `command_execution` / `commandExecution` → "Bash".
+    Command,
+    /// `file_change` / `fileChange` → "Edit".
+    FileChange,
+    /// `web_search` / `webSearch` → "WebSearch".
+    WebSearch,
+    /// `mcp_tool_call` / `mcpToolCall` → "{server}:{tool}" (caller supplies server/tool).
+    McpToolCall,
+    /// `collab_tool_call` / `collabToolCall` → "Agent".
+    CollabToolCall,
+}
+
+impl CodexToolKind {
+    /// Classify a Codex item `type` string, tolerating BOTH the exec snake_case and the
+    /// app-server camelCase spellings. Returns `None` for non-tool items (agent_message,
+    /// reasoning, user_message, todo_list, error, …) which each transport handles separately.
+    pub fn from_item_type(item_type: &str) -> Option<Self> {
+        match item_type {
+            "command_execution" | "commandExecution" => Some(Self::Command),
+            "file_change" | "fileChange" => Some(Self::FileChange),
+            "web_search" | "webSearch" => Some(Self::WebSearch),
+            "mcp_tool_call" | "mcpToolCall" => Some(Self::McpToolCall),
+            "collab_tool_call" | "collabToolCall" => Some(Self::CollabToolCall),
+            _ => None,
+        }
+    }
+
+    /// The fixed tool name for non-MCP kinds. `McpToolCall` returns `None` because its name is
+    /// `"{server}:{tool}"`, which depends on item fields the caller extracts (with its own
+    /// defaults for missing values, which differ slightly between transports).
+    pub fn fixed_tool_name(self) -> Option<&'static str> {
+        match self {
+            Self::Command => Some("Bash"),
+            Self::FileChange => Some("Edit"),
+            Self::WebSearch => Some("WebSearch"),
+            Self::CollabToolCall => Some("Agent"),
+            Self::McpToolCall => None,
+        }
+    }
+}
+
+/// Normalize a Codex item `status` to the app convention ("success" | "error"). Codex emits
+/// `completed` / `failed` / `declined` / `in_progress` (see exec_events.rs); only `failed` and
+/// `declined` are surfaced as errors, everything else (including missing/unknown) is "success".
+/// Shared by both Codex transports so the two parsers can't drift.
+pub fn codex_normalize_status(raw_status: &str) -> &'static str {
+    match raw_status {
+        "failed" | "declined" => "error",
+        _ => "success",
+    }
+}
+
 /// Extract text delta from a Codex NDJSON payload.
 ///
 /// Codex CLI v0.98+ output format (NDJSON):
@@ -25,7 +83,11 @@ pub fn extract_codex_delta(payload: &Value) -> Option<String> {
                 "command_execution" => {
                     // Show command + output in terminal
                     let cmd = item.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                    let output = item.get("output").and_then(|v| v.as_str()).unwrap_or("");
+                    let output = item
+                        .get("aggregated_output")
+                        .or_else(|| item.get("output")) // fallback for older Codex versions
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     if !cmd.is_empty() {
                         return Some(format!("$ {}\n{}", cmd, output));
                     }
@@ -85,7 +147,21 @@ mod tests {
     }
 
     #[test]
-    fn test_command_execution() {
+    fn test_command_execution_aggregated_output() {
+        // Codex v0.98+ uses aggregated_output (not output)
+        let payload = json!({
+            "type": "item.completed",
+            "item": {"type": "command_execution", "command": "ls", "aggregated_output": "file.txt"}
+        });
+        assert_eq!(
+            extract_codex_delta(&payload),
+            Some("$ ls\nfile.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn test_command_execution_legacy_output() {
+        // Older Codex versions used "output" field — fallback still works
         let payload = json!({
             "type": "item.completed",
             "item": {"type": "command_execution", "command": "ls", "output": "file.txt"}
@@ -100,7 +176,7 @@ mod tests {
     fn test_command_execution_empty_cmd() {
         let payload = json!({
             "type": "item.completed",
-            "item": {"type": "command_execution", "command": "", "output": ""}
+            "item": {"type": "command_execution", "command": "", "aggregated_output": ""}
         });
         assert_eq!(extract_codex_delta(&payload), None);
     }
@@ -175,5 +251,54 @@ mod tests {
     fn test_empty_payload() {
         let payload = json!({});
         assert_eq!(extract_codex_delta(&payload), None);
+    }
+
+    #[test]
+    fn tool_kind_accepts_both_casings() {
+        use CodexToolKind::*;
+        // snake_case (exec) and camelCase (app-server) classify identically.
+        for (snake, camel, kind) in [
+            ("command_execution", "commandExecution", Command),
+            ("file_change", "fileChange", FileChange),
+            ("web_search", "webSearch", WebSearch),
+            ("mcp_tool_call", "mcpToolCall", McpToolCall),
+            ("collab_tool_call", "collabToolCall", CollabToolCall),
+        ] {
+            assert_eq!(CodexToolKind::from_item_type(snake), Some(kind));
+            assert_eq!(CodexToolKind::from_item_type(camel), Some(kind));
+        }
+        // Non-tool item types → None.
+        for t in [
+            "agent_message",
+            "agentMessage",
+            "reasoning",
+            "todo_list",
+            "error",
+            "",
+        ] {
+            assert_eq!(CodexToolKind::from_item_type(t), None);
+        }
+    }
+
+    #[test]
+    fn tool_kind_fixed_names() {
+        use CodexToolKind::*;
+        assert_eq!(Command.fixed_tool_name(), Some("Bash"));
+        assert_eq!(FileChange.fixed_tool_name(), Some("Edit"));
+        assert_eq!(WebSearch.fixed_tool_name(), Some("WebSearch"));
+        assert_eq!(CollabToolCall.fixed_tool_name(), Some("Agent"));
+        // MCP has no fixed name — it's "{server}:{tool}", built by the caller.
+        assert_eq!(McpToolCall.fixed_tool_name(), None);
+    }
+
+    #[test]
+    fn normalize_status_failed_and_declined_are_errors() {
+        assert_eq!(codex_normalize_status("failed"), "error");
+        assert_eq!(codex_normalize_status("declined"), "error");
+        // Everything else (completed / in_progress / unknown / missing) is success.
+        assert_eq!(codex_normalize_status("completed"), "success");
+        assert_eq!(codex_normalize_status("in_progress"), "success");
+        assert_eq!(codex_normalize_status("whatever"), "success");
+        assert_eq!(codex_normalize_status(""), "success");
     }
 }

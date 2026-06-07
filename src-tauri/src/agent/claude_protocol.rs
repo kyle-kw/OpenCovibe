@@ -64,6 +64,7 @@ pub fn validate_bus_event(ev: &BusEvent) -> Option<ValidationWarn> {
             None
         }
         BusEvent::ToolProgress { tool_use_id, .. }
+        | BusEvent::ToolOutputDelta { tool_use_id, .. }
         | BusEvent::ToolUseSummary { tool_use_id, .. } => {
             if tool_use_id.is_empty() {
                 return Some(ValidationWarn {
@@ -87,6 +88,9 @@ pub fn validate_bus_event(ev: &BusEvent) -> Option<ValidationWarn> {
             }
             None // ALWAYS pass through
         }
+        // State-class (Codex thread goal): never drop — the GoalPanel needs every update,
+        // including the null-goal "cleared" signal.
+        BusEvent::GoalUpdate { .. } => None,
         // Everything else: pass through
         _ => None,
     }
@@ -1036,23 +1040,29 @@ impl ProtocolState {
                                     .collect::<HashMap<_, _>>()
                             });
 
-                    // Recalculate cost using our pricing table for accurate third-party model costs.
-                    // CLI uses its own (often Claude-based) pricing, which is wrong for providers
-                    // like DeepSeek, MiniMax, etc.
+                    // Cost source (#149): trust the CLI's reported cost for native Claude/OpenAI
+                    // — it knows its own pricing (incl. $0 for subscription/Max plans) and stays
+                    // correct across model releases without app updates. Only recalculate when a
+                    // third-party provider is present, since the CLI mis-prices those as Claude.
                     let (cost, model_usage) = if let Some(mut mu) = model_usage {
-                        let mut total = 0.0_f64;
-                        for (model_name, entry) in mu.iter_mut() {
-                            let recalculated = crate::pricing::estimate_cost(
-                                model_name,
-                                entry.input_tokens,
-                                entry.output_tokens,
-                                entry.cache_read_tokens,
-                                entry.cache_write_tokens,
-                            );
-                            entry.cost_usd = recalculated;
-                            total += recalculated;
+                        if mu.keys().any(|m| crate::pricing::is_third_party(m)) {
+                            let mut total = 0.0_f64;
+                            for (model_name, entry) in mu.iter_mut() {
+                                let recalculated = crate::pricing::estimate_cost(
+                                    model_name,
+                                    entry.input_tokens,
+                                    entry.output_tokens,
+                                    entry.cache_read_tokens,
+                                    entry.cache_write_tokens,
+                                );
+                                entry.cost_usd = recalculated;
+                                total += recalculated;
+                            }
+                            (total, Some(mu))
+                        } else {
+                            // Native only — keep the CLI's total_cost_usd and per-model costUSD.
+                            (cost, Some(mu))
                         }
-                        (total, Some(mu))
                     } else {
                         (cost, None)
                     };

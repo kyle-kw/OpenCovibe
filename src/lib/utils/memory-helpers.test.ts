@@ -1,26 +1,17 @@
 import { describe, it, expect } from "vitest";
 import { filterVisibleCandidates } from "./memory-helpers";
+import type { MemoryFileCandidate } from "$lib/types";
 
-const FILES = [
-  { path: "/project/CLAUDE.md", label: "CLAUDE.md", scope: "project" as const, exists: true },
+const FILES: MemoryFileCandidate[] = [
+  { path: "/project/CLAUDE.md", label: "CLAUDE.md", scope: "project", exists: true },
   {
     path: "/project/.claude/settings.json",
     label: "settings.json",
-    scope: "project" as const,
+    scope: "project",
     exists: true,
   },
-  {
-    path: "/project/.claude/AGENTS.md",
-    label: "AGENTS.md",
-    scope: "project" as const,
-    exists: false,
-  },
-  {
-    path: "/project/.claude/commands/foo.md",
-    label: "foo.md",
-    scope: "project" as const,
-    exists: false,
-  },
+  { path: "/project/.claude/AGENTS.md", label: "AGENTS.md", scope: "project", exists: false },
+  { path: "/project/.claude/commands/foo.md", label: "foo.md", scope: "project", exists: false },
 ];
 
 describe("filterVisibleCandidates", () => {

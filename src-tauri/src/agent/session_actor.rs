@@ -8,7 +8,11 @@
 
 use crate::agent::adapter::ActorSessionMap;
 use crate::agent::claude_protocol::{validate_bus_event, ProtocolState};
+use crate::agent::codex_appserver::CodexAppServer;
 use crate::agent::notify::notify_if_background;
+use crate::agent::session_protocol::{
+    CodexSkillRef, CodexTurnOverrides, LifecycleSignal, PendingKind, SessionProtocol,
+};
 use crate::agent::turn_engine::{
     apply_activity_reset, ActiveTurn, ContextExtractor, InternalExtractor, InternalJob, TurnOrigin,
     TurnPhase, UserTurnKind, UserTurnTicket, INTERNAL_HARD_TIMEOUT, INTERNAL_SOFT_TIMEOUT,
@@ -31,6 +35,29 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+/// Strip ANSI/CSI escape sequences (e.g. `\x1b[31m`) so colored CLI stderr renders cleanly.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // ESC [ ... <final byte in @..~> — consume the whole CSI sequence.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if ('@'..='~').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Extract content from `<promise>...</promise>` tag in text.
 fn extract_promise_tag(text: &str) -> Option<&str> {
     let start = text.find("<promise>")?;
@@ -51,6 +78,25 @@ fn truncate_str(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Build a control_response payload for the CLI. HC#2: the `request_id` MUST be nested
+/// inside `response`, not at the top level. `Ok` → success with a response body; `Err` →
+/// error with a message (the correct reply for a request the app cannot fulfill).
+fn build_control_response(request_id: &str, outcome: Result<Value, String>) -> Value {
+    let inner = match outcome {
+        Ok(response) => serde_json::json!({
+            "subtype": "success",
+            "request_id": request_id,
+            "response": response,
+        }),
+        Err(error) => serde_json::json!({
+            "subtype": "error",
+            "request_id": request_id,
+            "error": error,
+        }),
+    };
+    serde_json::json!({ "type": "control_response", "response": inner })
 }
 
 // ── Ralph Loop types ──
@@ -112,6 +158,9 @@ pub enum ActorCommand {
     SendMessage {
         text: String,
         attachments: Vec<AttachmentData>,
+        /// Codex skill picks → structured `{type:"skill"}` input items. Empty for Claude and for
+        /// Codex turns with no skill selected (no behavior change).
+        skills: Vec<CodexSkillRef>,
         reply: oneshot::Sender<Result<(), String>>,
     },
     /// Two-phase control: actor writes stdin + registers waiter → returns (request_id, response_rx).
@@ -143,6 +192,13 @@ pub enum ActorCommand {
     },
     /// MCP elicitation response: write control_response back to CLI stdin.
     RespondElicitation {
+        request_id: String,
+        response: Value,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Codex `request_user_input` (multiple-choice) answer → JSON-RPC response on the
+    /// app-server thread. `response` carries `{answers: {qid: [labels]}}`.
+    RespondUserInput {
         request_id: String,
         response: Value,
         reply: oneshot::Sender<Result<(), String>>,
@@ -182,6 +238,16 @@ struct SessionActor {
     run_id: String,
     tag: Arc<()>,
     protocol: ProtocolState,
+    /// Codex `app-server` protocol driver. `Some` routes the wire seams (startup, user turn,
+    /// stdout parse, response framing) through it; `None` = Claude stream-json (unchanged).
+    codex: Option<CodexAppServer>,
+    /// Codex handshake messages to write once at run start (initialize + thread/start|resume).
+    codex_startup: Vec<Value>,
+    /// Codex thread/started seen — gates turn dispatch until the thread is open.
+    codex_ready: bool,
+    /// Live per-turn Codex overrides (model/effort/approval/sandbox) set via control subtypes
+    /// without respawning. Injected into each `turn/start`. Ignored for Claude.
+    codex_overrides: CodexTurnOverrides,
     /// Current RunState string — identity dedup: skip emit if unchanged.
     state: String,
     stdin: Option<ChildStdin>,
@@ -259,6 +325,9 @@ pub fn spawn_actor(
     cancel: CancellationToken,
     initial_turn_index: u32,
     initial_auto_ctx_id: u32,
+    // Codex app-server transport: the driver + its handshake messages. `None`/empty = Claude.
+    codex: Option<CodexAppServer>,
+    codex_startup: Vec<Value>,
 ) -> SessionActorHandle {
     let tag = Arc::new(());
     let (cmd_tx, cmd_rx) = mpsc::channel::<ActorCommand>(64);
@@ -278,6 +347,10 @@ pub fn spawn_actor(
         run_id: run_id.clone(),
         tag: tag.clone(),
         protocol: ProtocolState::new(is_resume),
+        codex,
+        codex_startup,
+        codex_ready: false,
+        codex_overrides: CodexTurnOverrides::default(),
         state: String::new(),
         stdin: Some(stdin),
         child: Some(child),
@@ -340,6 +413,17 @@ impl SessionActor {
             self.protocol.is_resume()
         );
 
+        // Codex app-server handshake: write initialize + thread/start|resume before the loop.
+        // The thread isn't open until thread/started arrives (gates try_dispatch via codex_ready).
+        if !self.codex_startup.is_empty() {
+            let msgs = std::mem::take(&mut self.codex_startup);
+            for msg in &msgs {
+                if let Err(e) = self.write_json_line(msg, "codex handshake").await {
+                    log::error!("[actor] codex handshake write failed: {}", e);
+                }
+            }
+        }
+
         loop {
             // HC #18: terminated → break loop
             if self.terminated {
@@ -354,8 +438,8 @@ impl SessionActor {
                 // 1. Commands from IPC layer
                 cmd = cmd_rx.recv() => {
                     match cmd {
-                        Some(ActorCommand::SendMessage { text, attachments, reply }) => {
-                            self.handle_send_message(text, attachments, reply).await;
+                        Some(ActorCommand::SendMessage { text, attachments, skills, reply }) => {
+                            self.handle_send_message(text, attachments, skills, reply).await;
                         }
                         Some(ActorCommand::Stop { reply }) => {
                             let r = self.handle_stop().await;
@@ -384,7 +468,13 @@ impl SessionActor {
                         Some(ActorCommand::RespondElicitation { request_id, response, reply }) => {
                             log::debug!("[actor] RespondElicitation: run_id={}, req_id={}", self.run_id, request_id);
                             self.clear_pending_interactive_request(&request_id);
-                            let result = self.write_control_response(&request_id, response).await;
+                            let result = self.write_interactive_response(PendingKind::Elicitation, &request_id, response).await;
+                            let _ = reply.send(result);
+                        }
+                        Some(ActorCommand::RespondUserInput { request_id, response, reply }) => {
+                            log::debug!("[actor] RespondUserInput: run_id={}, req_id={}", self.run_id, request_id);
+                            self.clear_pending_interactive_request(&request_id);
+                            let result = self.write_interactive_response(PendingKind::UserInput, &request_id, response).await;
                             let _ = reply.send(result);
                         }
                         Some(ActorCommand::StartRalphLoop { prompt, max_iterations, completion_promise, reply }) => {
@@ -512,6 +602,7 @@ impl SessionActor {
         &mut self,
         text: String,
         attachments: Vec<AttachmentData>,
+        skills: Vec<CodexSkillRef>,
         reply: oneshot::Sender<Result<(), String>>,
     ) {
         if self.terminated {
@@ -555,6 +646,7 @@ impl SessionActor {
             ticket_seq: seq,
             text,
             attachments,
+            skills,
             kind,
             turn_index,
             reply,
@@ -566,6 +658,10 @@ impl SessionActor {
     /// Try to dispatch next queued item. HC #1: One turn at a time.
     async fn try_dispatch(&mut self) {
         if self.active_turn.is_some() || self.quarantine_until_result || self.terminated {
+            return;
+        }
+        // Codex: hold dispatch until the app-server thread is open (thread/started seen).
+        if self.codex.is_some() && !self.codex_ready {
             return;
         }
 
@@ -660,7 +756,7 @@ impl SessionActor {
 
         // Write to stdin
         let user_uuid = match self
-            .write_user_to_stdin(&ticket.text, &ticket.attachments)
+            .write_user_to_stdin(&ticket.text, &ticket.attachments, &ticket.skills)
             .await
         {
             Ok(uuid) => uuid,
@@ -677,6 +773,8 @@ impl SessionActor {
             run_id: self.run_id.clone(),
             text: ticket.text.clone(),
             uuid: Some(user_uuid),
+            client_uuid: None,
+            attachments: vec![],
         });
         self.emit_state("running", None, None, false);
         self.persist_idle_running(RunStatus::Running);
@@ -709,7 +807,7 @@ impl SessionActor {
         self.protocol
             .set_pending_slash_command(Some("/context".to_string()));
 
-        if let Err(e) = self.write_user_to_stdin("/context", &[]).await {
+        if let Err(e) = self.write_user_to_stdin("/context", &[], &[]).await {
             log::warn!("[turn] start_internal: stdin write failed: {}", e);
             self.must_run_internal_for_turn = None;
             self.protocol.set_pending_slash_command(None);
@@ -810,7 +908,7 @@ impl SessionActor {
             ralph.turn_toplevel_texts.clear();
         }
 
-        let user_uuid = match self.write_user_to_stdin(&prompt, &[]).await {
+        let user_uuid = match self.write_user_to_stdin(&prompt, &[], &[]).await {
             Ok(uuid) => uuid,
             Err(e) => {
                 log::error!("[ralph] stdin write failed: {}", e);
@@ -839,6 +937,8 @@ impl SessionActor {
             run_id: self.run_id.clone(),
             text: prompt,
             uuid: Some(user_uuid),
+            client_uuid: None,
+            attachments: vec![],
         });
         self.emit_state("running", None, None, false);
         self.persist_idle_running(RunStatus::Running);
@@ -1125,7 +1225,56 @@ impl SessionActor {
         &mut self,
         text: &str,
         attachments: &[AttachmentData],
+        skills: &[CodexSkillRef],
     ) -> Result<String, String> {
+        // Codex app-server: frame the user message as turn/start instead of stream-json.
+        // Codex takes attachments as local file *paths* (not base64 blocks like Claude):
+        // images become `localImage` input items (real vision input), and every attachment
+        // is also listed in a text breadcrumb so Codex can `Read` non-image files. This
+        // mirrors the exec path (chat.rs / spawn.rs `--image=`).
+        if self.codex.is_some() {
+            let mut image_paths: Vec<String> = Vec::new();
+            let mut breadcrumb_files: Vec<String> = Vec::new();
+            for att in attachments {
+                let Some(path) = save_attachment_to_disk(&self.run_id, att) else {
+                    continue;
+                };
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                if att.media_type.starts_with("image/") {
+                    image_paths.push(path.clone());
+                }
+                breadcrumb_files.push(format!(
+                    "- {} ({}, {} bytes) => {}",
+                    att.filename, att.media_type, size, path
+                ));
+            }
+            let augmented = if breadcrumb_files.is_empty() {
+                text.to_string()
+            } else {
+                format!(
+                    "{}\n\nAttached files:\n{}\nUse these local file paths directly when needed.",
+                    text,
+                    breadcrumb_files.join("\n")
+                )
+            };
+            if !breadcrumb_files.is_empty() {
+                log::debug!(
+                    "[codex] app-server turn with {} attachment(s), {} image(s)",
+                    breadcrumb_files.len(),
+                    image_paths.len()
+                );
+            }
+            let overrides = self.codex_overrides.clone();
+            let Some(codex) = self.codex.as_mut() else {
+                return Err("codex driver missing".to_string());
+            };
+            let lines = codex.frame_user_turn(&augmented, &image_paths, skills, &overrides);
+            for line in &lines {
+                self.write_json_line(line, "codex turn/start").await?;
+            }
+            return Ok(uuid::Uuid::new_v4().to_string());
+        }
+
         let stdin = self
             .stdin
             .as_mut()
@@ -1225,13 +1374,25 @@ impl SessionActor {
         let subtype = request
             .get("subtype")
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
         log::debug!(
             "[actor] send_control: run_id={}, subtype={}, req_id={}",
             self.run_id,
             subtype,
             request_id
         );
+
+        // Codex app-server has no stream-json control protocol. Interpret the control subtypes
+        // locally: set_* mutate the stored per-turn overrides (applied on the next turn/start);
+        // interrupt/steer write a JSON-RPC frame to the app-server now. We resolve the control
+        // waiter synchronously here so the IPC caller's `send_session_control` returns Ok without
+        // a Claude `control_request` ever going to the wire.
+        if self.codex.is_some() {
+            return self
+                .handle_codex_control(&subtype, &request, request_id)
+                .await;
+        }
 
         if subtype == "interrupt" {
             self.pending_interrupt = true;
@@ -1249,6 +1410,258 @@ impl SessionActor {
 
         self.write_json_line(&payload, "control request").await?;
 
+        Ok((request_id, rx))
+    }
+
+    /// Codex-only control handler. Interprets the frontend's `sendSessionControl` subtypes
+    /// against the bidirectional app-server. Two response shapes:
+    ///   - Fire-and-forget (`set_*`, `interrupt`, `steer`, `compact`, `goal_set`, `goal_clear`):
+    ///     the waiter is resolved synchronously with `{ok:true}` after the frame is written.
+    ///   - Data-returning (`rollback`, `fork`, `goal_get`): the waiter is REGISTERED in
+    ///     `control_waiters` keyed by `request_id` and the frame method maps the JSON-RPC id back
+    ///     to that `request_id` (`client_waiters`). `parse_line` later routes the server reply via
+    ///     `control_response`, which `handle_codex_line` forwards to the registered waiter. These
+    ///     subtypes return WITHOUT sending `{ok:true}` — the wire reply is the resolution.
+    async fn handle_codex_control(
+        &mut self,
+        subtype: &str,
+        request: &Value,
+        request_id: String,
+    ) -> Result<(String, oneshot::Receiver<Value>), String> {
+        let (tx, rx) = oneshot::channel();
+
+        // Data-returning subtypes: register the waiter, write the tracked frame, and return the
+        // rx WITHOUT resolving — parse_line routes the server reply back to this waiter.
+        match subtype {
+            "rollback" => {
+                let num_turns = request
+                    .get("num_turns")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1);
+                let lines = self
+                    .codex
+                    .as_mut()
+                    .unwrap()
+                    .frame_rollback(&request_id, num_turns);
+                if lines.is_empty() {
+                    // No open thread → nothing to roll back; resolve so the caller isn't stuck.
+                    let _ = tx.send(serde_json::json!({ "ok": false, "error": "no thread" }));
+                    return Ok((request_id, rx));
+                }
+                self.control_waiters.insert(request_id.clone(), tx);
+                for line in &lines {
+                    self.write_json_line(line, "codex thread/rollback").await?;
+                }
+                return Ok((request_id, rx));
+            }
+            "fork" => {
+                let lines = self.codex.as_mut().unwrap().frame_fork(&request_id);
+                if lines.is_empty() {
+                    let _ = tx.send(serde_json::json!({ "ok": false, "error": "no thread" }));
+                    return Ok((request_id, rx));
+                }
+                self.control_waiters.insert(request_id.clone(), tx);
+                for line in &lines {
+                    self.write_json_line(line, "codex thread/fork").await?;
+                }
+                return Ok((request_id, rx));
+            }
+            "goal_get" => {
+                let lines = self.codex.as_mut().unwrap().frame_goal_get(&request_id);
+                if lines.is_empty() {
+                    let _ = tx.send(serde_json::json!({ "ok": false, "error": "no thread" }));
+                    return Ok((request_id, rx));
+                }
+                self.control_waiters.insert(request_id.clone(), tx);
+                for line in &lines {
+                    self.write_json_line(line, "codex thread/goal/get").await?;
+                }
+                return Ok((request_id, rx));
+            }
+            // Codex MCP runtime status: reuse the shared "mcp_status" subtype (McpStatusPanel)
+            // but route it to mcpServerStatus/list. Reply shape differs from Claude's mcp_status
+            // ({data: McpServerStatus[]}); the frontend normalizes both.
+            "mcp_status" => {
+                let lines = self.codex.as_mut().unwrap().frame_mcp_status(&request_id);
+                if lines.is_empty() {
+                    let _ = tx.send(serde_json::json!({ "ok": false, "error": "no thread" }));
+                    return Ok((request_id, rx));
+                }
+                self.control_waiters.insert(request_id.clone(), tx);
+                for line in &lines {
+                    self.write_json_line(line, "codex mcpServerStatus/list")
+                        .await?;
+                }
+                return Ok((request_id, rx));
+            }
+            "skills_list" => {
+                let lines = self.codex.as_mut().unwrap().frame_skills_list(&request_id);
+                if lines.is_empty() {
+                    let _ = tx.send(serde_json::json!({ "ok": false, "error": "no thread" }));
+                    return Ok((request_id, rx));
+                }
+                self.control_waiters.insert(request_id.clone(), tx);
+                for line in &lines {
+                    self.write_json_line(line, "codex skills/list").await?;
+                }
+                return Ok((request_id, rx));
+            }
+            "experimental_feature_list" => {
+                let lines = self
+                    .codex
+                    .as_mut()
+                    .unwrap()
+                    .frame_experimental_feature_list(&request_id);
+                if lines.is_empty() {
+                    let _ = tx.send(serde_json::json!({ "ok": false, "error": "no thread" }));
+                    return Ok((request_id, rx));
+                }
+                self.control_waiters.insert(request_id.clone(), tx);
+                for line in &lines {
+                    self.write_json_line(line, "codex experimentalFeature/list")
+                        .await?;
+                }
+                return Ok((request_id, rx));
+            }
+            "model_list" => {
+                let lines = self.codex.as_mut().unwrap().frame_model_list(&request_id);
+                if lines.is_empty() {
+                    let _ = tx.send(serde_json::json!({ "ok": false, "error": "no thread" }));
+                    return Ok((request_id, rx));
+                }
+                self.control_waiters.insert(request_id.clone(), tx);
+                for line in &lines {
+                    self.write_json_line(line, "codex model/list").await?;
+                }
+                return Ok((request_id, rx));
+            }
+            _ => {}
+        }
+
+        match subtype {
+            "interrupt" => {
+                // Native stop: turn/interrupt halts the running turn in place (no process kill,
+                // no respawn). The session stays alive for the next message.
+                let lines = self.codex.as_mut().unwrap().frame_interrupt();
+                if lines.is_empty() {
+                    log::debug!(
+                        "[actor] codex interrupt: no active turn/thread, nothing to send (run_id={})",
+                        self.run_id
+                    );
+                }
+                for line in &lines {
+                    self.write_json_line(line, "codex turn/interrupt").await?;
+                }
+            }
+            "set_permission_mode" => {
+                // {mode} → Codex AskForApproval string + sandbox mode string. Normalize the app
+                // mode through map_permission_mode first so both app names ("plan", "auto_all")
+                // and CLI names ("bypassPermissions") map consistently. Stored, applied on the
+                // next turn/start (which converts the sandbox string to a SandboxPolicy object).
+                if let Some(mode) = request.get("mode").and_then(|v| v.as_str()) {
+                    let cli_mode = crate::agent::adapter::map_permission_mode(mode);
+                    self.codex_overrides.approval_policy = Some(
+                        crate::commands::session::codex_approval_for(Some(&cli_mode)),
+                    );
+                    self.codex_overrides.sandbox =
+                        Some(crate::commands::session::codex_sandbox_for(Some(&cli_mode)));
+                    log::debug!(
+                        "[actor] codex override set_permission_mode: mode={} → approval={:?} sandbox={:?}",
+                        mode,
+                        self.codex_overrides.approval_policy,
+                        self.codex_overrides.sandbox
+                    );
+                }
+            }
+            "set_model" => {
+                if let Some(model) = request.get("model").and_then(|v| v.as_str()) {
+                    self.codex_overrides.model = Some(model.to_string());
+                    log::debug!("[actor] codex override set_model: {}", model);
+                }
+            }
+            "set_effort" => {
+                if let Some(effort) = request.get("effort").and_then(|v| v.as_str()) {
+                    self.codex_overrides.effort = Some(effort.to_string());
+                    log::debug!("[actor] codex override set_effort: {}", effort);
+                }
+            }
+            "steer" => {
+                // Mid-turn steer: inject guidance into the currently-running turn. Drops silently
+                // if there's no active turn (frame_steer returns empty + logs).
+                if let Some(text) = request.get("text").and_then(|v| v.as_str()) {
+                    let lines = self.codex.as_mut().unwrap().frame_steer(text);
+                    if lines.is_empty() {
+                        log::debug!(
+                            "[actor] codex steer: no active turn, nothing to send (run_id={})",
+                            self.run_id
+                        );
+                    }
+                    for line in &lines {
+                        self.write_json_line(line, "codex turn/steer").await?;
+                    }
+                }
+            }
+            "compact" => {
+                // thread/compact/start returns an empty {} ack; the compaction itself surfaces
+                // later via the thread/compacted notification. Fire-and-forget {ok:true}.
+                let lines = self.codex.as_mut().unwrap().frame_compact(&request_id);
+                if lines.is_empty() {
+                    log::debug!(
+                        "[actor] codex compact: no thread, nothing to send (run_id={})",
+                        self.run_id
+                    );
+                }
+                for line in &lines {
+                    self.write_json_line(line, "codex thread/compact/start")
+                        .await?;
+                }
+            }
+            "goal_set" => {
+                // {objective?, status?, token_budget?} → thread/goal/set. The authoritative goal
+                // arrives via thread/goal/updated (→ GoalUpdate), so fire-and-forget {ok:true}.
+                let objective = request.get("objective").and_then(|v| v.as_str());
+                let status = request.get("status").and_then(|v| v.as_str());
+                let token_budget = request.get("token_budget").and_then(|v| v.as_u64());
+                let lines = self.codex.as_mut().unwrap().frame_goal_set(
+                    &request_id,
+                    objective,
+                    status,
+                    token_budget,
+                );
+                if lines.is_empty() {
+                    log::debug!(
+                        "[actor] codex goal_set: no thread, nothing to send (run_id={})",
+                        self.run_id
+                    );
+                }
+                for line in &lines {
+                    self.write_json_line(line, "codex thread/goal/set").await?;
+                }
+            }
+            "goal_clear" => {
+                let lines = self.codex.as_mut().unwrap().frame_goal_clear(&request_id);
+                if lines.is_empty() {
+                    log::debug!(
+                        "[actor] codex goal_clear: no thread, nothing to send (run_id={})",
+                        self.run_id
+                    );
+                }
+                for line in &lines {
+                    self.write_json_line(line, "codex thread/goal/clear")
+                        .await?;
+                }
+            }
+            other => {
+                log::debug!(
+                    "[actor] codex control subtype '{}' not supported — acking (run_id={})",
+                    other,
+                    self.run_id
+                );
+            }
+        }
+
+        // Resolve the waiter immediately — these are local, no wire round-trip to await.
+        let _ = tx.send(serde_json::json!({ "ok": true }));
         Ok((request_id, rx))
     }
 
@@ -1279,7 +1692,27 @@ impl SessionActor {
             request_id,
         );
         self.clear_pending_interactive_request(request_id);
-        self.write_control_response(request_id, response).await
+        self.write_interactive_response(PendingKind::Permission, request_id, response)
+            .await
+    }
+
+    /// Write a response to a pending interactive request. Codex frames it as a JSON-RPC
+    /// response via the protocol driver; Claude uses the stream-json control_response.
+    async fn write_interactive_response(
+        &mut self,
+        kind: PendingKind,
+        request_id: &str,
+        response: Value,
+    ) -> Result<(), String> {
+        let Some(codex) = self.codex.as_mut() else {
+            return self.write_control_response(request_id, response).await;
+        };
+        let lines = codex.frame_response(kind, request_id, response);
+        for line in &lines {
+            self.write_json_line(line, "codex interactive response")
+                .await?;
+        }
+        Ok(())
     }
 
     /// Clear pending interactive request if it matches the given request_id.
@@ -1298,6 +1731,9 @@ impl SessionActor {
     }
 
     /// Send a control_cancel_request to CLI stdin (top-level message type).
+    /// Used only for explicit user-initiated cancellation (ActorCommand::CancelControlRequest,
+    /// e.g. the user dismisses a permission prompt). NOT for auto-declining unsupported
+    /// requests — those use write_control_response_error (the CLI waits for a response).
     async fn handle_cancel_control_request(&mut self, request_id: &str) -> Result<(), String> {
         let payload = serde_json::json!({
             "type": "control_cancel_request",
@@ -1334,22 +1770,13 @@ impl SessionActor {
         Ok(())
     }
 
-    /// Shared helper: write a control_response JSON to CLI stdin.
+    /// Shared helper: write a success control_response JSON to CLI stdin.
     async fn write_control_response(
         &mut self,
         request_id: &str,
         response: Value,
     ) -> Result<(), String> {
-        // CLI expects: {"type":"control_response","response":{"subtype":"success","request_id":"...","response":{...}}}
-        // request_id must be INSIDE the response wrapper, with subtype:"success"
-        let payload = serde_json::json!({
-            "type": "control_response",
-            "response": {
-                "subtype": "success",
-                "request_id": request_id,
-                "response": response,
-            },
-        });
+        let payload = build_control_response(request_id, Ok(response));
         log::debug!(
             "[actor] write_control_response: run_id={}, req_id={}",
             self.run_id,
@@ -1358,15 +1785,137 @@ impl SessionActor {
         self.write_json_line(&payload, "control response").await
     }
 
+    /// Write an error control_response to CLI stdin — the protocol-correct reply for a
+    /// control_request the app cannot fulfill (HC#2). Sending control_cancel_request here
+    /// instead would leave the CLI waiting for a response until USER_HARD_TIMEOUT.
+    async fn write_control_response_error(
+        &mut self,
+        request_id: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        let payload = build_control_response(request_id, Err(error.to_string()));
+        log::debug!(
+            "[actor] write_control_response_error: run_id={}, req_id={}, error={}",
+            self.run_id,
+            request_id,
+            error,
+        );
+        self.write_json_line(&payload, "control response (error)")
+            .await
+    }
+
     // ── I/O handlers ──
 
     /// Handle a stdout line from CLI — three-way routing: quarantine → control → map events.
+    /// Codex `app-server` stdout handling. Parses one JSON-RPC line via the protocol driver
+    /// and routes its events / lifecycle / interactive / thread-id signals into the *shared*
+    /// turn engine (`end_turn_and_dispatch`, `emit_state`) — no Claude control protocol.
+    async fn handle_codex_line(&mut self, text: &str) {
+        apply_activity_reset(self.quarantine_until_result, &mut self.active_turn);
+
+        let parsed = self.codex.as_mut().unwrap().parse_line(&self.run_id, text);
+
+        // Route a data-returning request reply (thread/fork, thread/rollback, thread/goal/get)
+        // back to the waiting control caller — mirrors the Claude control_response path.
+        if let Some((rid, resp)) = parsed.control_response {
+            log::debug!("[codex] control_response for req_id={}", rid);
+            if let Some(tx) = self.control_waiters.remove(&rid) {
+                let _ = tx.send(resp);
+            }
+        }
+
+        // Persist the thread id (resume key) as soon as it's known.
+        if let Some(tid) = parsed.thread_id {
+            let rid = self.run_id.clone();
+            if let Err(e) = crate::storage::runs::with_meta(&rid, |meta| {
+                meta.conversation_ref =
+                    Some(crate::models::ConversationRef::CodexThread(tid.clone()));
+                Ok(())
+            }) {
+                log::warn!("[codex] failed to persist conversation_ref: {}", e);
+            } else {
+                log::debug!(
+                    "[codex] captured thread_id as conversation_ref for run_id={}",
+                    rid
+                );
+            }
+        }
+
+        // Open the dispatch gate once the thread is ready (new thread/started or resume ack),
+        // then flush the queued initial/user message.
+        if !self.codex_ready && self.codex.as_ref().map(|c| c.is_ready()).unwrap_or(false) {
+            self.codex_ready = true;
+            log::debug!(
+                "[codex] thread ready for run_id={}; dispatching queue",
+                self.run_id
+            );
+            self.try_dispatch().await;
+        }
+
+        // Emit mapped events (message/tool/usage + any interactive prompt events).
+        for event in &parsed.events {
+            if let Some(warn) = validate_bus_event(event) {
+                log::warn!(
+                    "[actor] invalid codex event dropped: {}.{}: {}",
+                    warn.event_type,
+                    warn.field,
+                    warn.detail
+                );
+                continue;
+            }
+            self.persist_and_emit(event);
+        }
+
+        // Track a pending interactive request (observability + desktop notification).
+        if let Some(pi) = parsed.interactive {
+            let subtype = match pi.kind {
+                PendingKind::Permission => "can_use_tool",
+                PendingKind::Elicitation => "elicitation",
+                PendingKind::UserInput => "request_user_input",
+            };
+            self.pending_interactive_request = Some(PendingInteractiveRequest {
+                request_id: pi.request_id,
+                subtype: subtype.to_string(),
+                detail: String::new(),
+                received_at: Instant::now(),
+            });
+            notify_if_background(self.emitter.app(), "Codex", "needs your input");
+        }
+
+        // Turn lifecycle → RunState + advance the shared turn queue.
+        if let Some(sig) = parsed.lifecycle {
+            match sig {
+                LifecycleSignal::TurnStarted => {
+                    self.emit_state("running", None, None, false);
+                }
+                LifecycleSignal::TurnCompleted => {
+                    self.emit_state("idle", Some(0), None, true);
+                    self.persist_idle_running(RunStatus::Idle);
+                    self.end_turn_and_dispatch().await;
+                }
+                LifecycleSignal::TurnFailed(err) => {
+                    // Codex turn failure keeps the session alive (input box returns).
+                    self.emit_state("idle", None, err, true);
+                    self.persist_idle_running(RunStatus::Idle);
+                    self.end_turn_and_dispatch().await;
+                }
+            }
+        }
+    }
+
     async fn handle_stdout_line(&mut self, text: &str, line_num: u64) {
         let text = text.trim();
         if text.is_empty() {
             return;
         }
         log::trace!("[actor] stdout #{}: {}", line_num, truncate_str(text, 200));
+
+        // Codex app-server transport: own parse + lifecycle handling (bypasses the
+        // stream-json control protocol path entirely; Claude code below is untouched).
+        if self.codex.is_some() {
+            self.handle_codex_line(text).await;
+            return;
+        }
 
         // Step 0: JSON parse
         let parsed = match serde_json::from_str::<Value>(text) {
@@ -1934,8 +2483,8 @@ impl SessionActor {
                 ),
             );
         } else {
-            // Fallback: unknown or malformed subtype — send control_cancel_request
-            // to tell CLI we can't handle this request (avoids CLI hanging forever).
+            // Fallback: unknown or malformed subtype — reply with an error control_response
+            // so the CLI fails fast instead of waiting for a response until USER_HARD_TIMEOUT.
             let req_id = parsed
                 .get("request_id")
                 .and_then(|v| v.as_str())
@@ -1950,9 +2499,15 @@ impl SessionActor {
                     .map(|r| r.as_object().map(|o| o.keys().collect::<Vec<_>>()))
             );
             if !req_id.is_empty() {
-                if let Err(e) = self.handle_cancel_control_request(req_id).await {
+                if let Err(e) = self
+                    .write_control_response_error(
+                        req_id,
+                        &format!("unsupported control_request subtype: {}", subtype),
+                    )
+                    .await
+                {
                     log::warn!(
-                        "[actor] cancel_control_request failed: run_id={}, req_id={}, subtype={}, err={}",
+                        "[actor] control_response(error) failed: run_id={}, req_id={}, subtype={}, err={}",
                         self.run_id, req_id, subtype, e
                     );
                 }
@@ -2021,35 +2576,35 @@ impl SessionActor {
             request_id
         );
 
-        let response = match subtype {
-            "can_use_tool" => Some(serde_json::json!({
+        // can_use_tool/hook_callback get a success auto-response. Everything else
+        // (elicitation can't be serviced without a user during an internal turn, and
+        // unknown subtypes have no schema) gets a protocol-correct error response —
+        // never control_cancel_request, which would leave the CLI waiting until timeout.
+        let result: Result<Value, String> = match subtype {
+            "can_use_tool" => Ok(serde_json::json!({
                 "behavior": "deny",
                 "message": "Tool use not allowed during internal turn"
             })),
-            "hook_callback" => Some(serde_json::json!({ "decision": "allow" })),
-            "elicitation" => None, // auto-decline via control_cancel_request
-            _ => None,             // unknown subtype — cancel instead of guessing schema
+            "hook_callback" => Ok(serde_json::json!({ "decision": "allow" })),
+            _ => Err(format!(
+                "unsupported control_request subtype during internal turn: {}",
+                subtype
+            )),
         };
 
-        if let Some(response) = response {
-            if let Err(e) = self.write_control_response(&request_id, response).await {
+        let write = match result {
+            Ok(response) => self.write_control_response(&request_id, response).await,
+            Err(msg) => {
                 log::warn!(
-                    "[turn] internal control auto-response failed: req_id={}, err={}",
-                    request_id,
-                    e
+                    "[turn] internal: unhandled control_request: run_id={}, subtype={}, req_id={}",
+                    self.run_id,
+                    subtype,
+                    request_id
                 );
+                self.write_control_response_error(&request_id, &msg).await
             }
-            return;
-        }
-
-        // Unknown or elicitation subtype: send control_cancel_request (schema-agnostic)
-        log::warn!(
-            "[turn] internal: unhandled control_request: run_id={}, subtype={}, req_id={}",
-            self.run_id,
-            subtype,
-            request_id
-        );
-        if let Err(e) = self.handle_cancel_control_request(&request_id).await {
+        };
+        if let Err(e) = write {
             log::warn!(
                 "[turn] internal control auto-response failed: req_id={}, err={}",
                 request_id,
@@ -2077,10 +2632,20 @@ impl SessionActor {
             truncate_str(text, 200)
         );
 
+        // Codex app-server writes verbose ANSI-colored tracing logs to stderr (DEBUG/INFO/
+        // ERROR lines, including expected ones like "exec_command failed: Rejected(rejected by
+        // user)"). Meaningful events (errors, results, approvals) all arrive via stdout
+        // JSON-RPC, so surfacing stderr as timeline cards is pure noise (and renders garbled
+        // due to the ANSI escapes). Log it for diagnostics, don't emit it.
+        if self.codex.is_some() {
+            log::debug!("[actor] codex stderr: {}", truncate_str(text, 300));
+            return;
+        }
+
         let event = BusEvent::Raw {
             run_id: self.run_id.clone(),
             source: "claude_stderr".to_string(),
-            data: Value::String(text.to_string()),
+            data: Value::String(strip_ansi(text)),
         };
         self.emitter.persist_and_emit(&self.run_id, &event);
     }
@@ -2539,6 +3104,7 @@ pub fn build_user_payload(
 
 #[cfg(test)]
 mod tests {
+    use super::build_control_response;
     use crate::models::{max_attachment_size, ALLOWED_DOC_TYPES, ALLOWED_IMAGE_TYPES};
     use serde_json::json;
 
@@ -2595,6 +3161,28 @@ mod tests {
     }
 
     #[test]
+    fn control_response_success_shape() {
+        let p = build_control_response("r1", Ok(serde_json::json!({ "x": 1 })));
+        assert_eq!(p["type"], "control_response");
+        assert_eq!(p["response"]["subtype"], "success");
+        // HC#2: request_id nested inside `response`, NOT at top level.
+        assert_eq!(p["response"]["request_id"], "r1");
+        assert!(p.get("request_id").is_none());
+        assert_eq!(p["response"]["response"]["x"], 1);
+    }
+
+    #[test]
+    fn control_response_error_shape() {
+        let p = build_control_response("r2", Err("nope".to_string()));
+        assert_eq!(p["type"], "control_response");
+        assert_eq!(p["response"]["subtype"], "error");
+        assert_eq!(p["response"]["request_id"], "r2");
+        assert_eq!(p["response"]["error"], "nope");
+        // Error responses carry no nested `response` body.
+        assert!(p["response"].get("response").is_none());
+    }
+
+    #[test]
     fn mixed_attachments() {
         let parts = build_content_parts(
             "hello",
@@ -2633,5 +3221,14 @@ mod tests {
         assert_eq!(payload["type"], "user");
         assert_eq!(payload["uuid"], uuid);
         assert!(uuid::Uuid::parse_str(&uuid).is_ok());
+    }
+
+    #[test]
+    fn strip_ansi_removes_color_codes() {
+        use super::strip_ansi;
+        let input = "\u{1b}[2m2026-06-03\u{1b}[0m \u{1b}[31mERROR\u{1b}[0m codex_core: failed";
+        assert_eq!(strip_ansi(input), "2026-06-03 ERROR codex_core: failed");
+        // Plain text is unchanged.
+        assert_eq!(strip_ansi("no codes here"), "no codes here");
     }
 }

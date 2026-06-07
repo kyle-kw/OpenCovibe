@@ -20,7 +20,11 @@
     extractFilesFromPersisted,
     mergeFileEntries,
   } from "$lib/utils/file-entries";
-  import { extractTaskToolMeta, type TaskToolMeta } from "$lib/utils/tool-rendering";
+  import {
+    extractTaskToolMeta,
+    isSubagentTool,
+    type TaskToolMeta,
+  } from "$lib/utils/tool-rendering";
   import type { TaskNotificationItem } from "$lib/stores/session-store.svelte";
 
   let {
@@ -414,7 +418,7 @@
     const result: SubagentInfo[] = [];
     for (const turn of turns) {
       for (const node of flattenNodes(turn.tools)) {
-        if (node.tool_name === "Task") {
+        if (isSubagentTool(node.tool_name)) {
           const meta = extractTaskToolMeta(node.input);
           if (!meta) continue;
           // Count nested tools from the result

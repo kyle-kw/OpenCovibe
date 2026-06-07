@@ -4,7 +4,7 @@
   import type { TaskRun, McpServerInfo, CliModelInfo } from "$lib/types";
   import type { TurnUsage } from "$lib/stores/types";
   import { dbg } from "$lib/utils/debug";
-  import { getCliModels } from "$lib/stores/cli-info.svelte";
+  import { getModelsForAgent } from "$lib/stores/cli-info.svelte";
   import { t } from "$lib/i18n/index.svelte";
   import { fmtNumber } from "$lib/i18n/format";
   import { truncate, formatTokenCount, formatDuration, formatCostDisplay } from "$lib/utils/format";
@@ -35,6 +35,7 @@
     durationMs,
     persistedFiles,
     onRewind,
+    onCodexRewind,
     contextUtilization,
     contextWarningLevel,
     contextWindow,
@@ -86,6 +87,8 @@
     durationMs?: number;
     persistedFiles?: unknown[];
     onRewind?: () => void;
+    /** Codex turn-based rewind (history only). Distinct from snapshot onRewind. */
+    onCodexRewind?: () => void;
     contextUtilization?: number;
     contextWarningLevel?: string;
     cwd?: string;
@@ -210,7 +213,7 @@
 
   // ── Model selector dropdown ──
   // Use platform-specific models when a third-party provider is active
-  let models = $derived(platformModels.length > 0 ? platformModels : getCliModels());
+  let models = $derived(getModelsForAgent(agent, { platformModels }));
   let dropdownOpen = $state(false);
   let focusedModelIdx = $state(-1);
   let modelBtnEl: HTMLButtonElement | undefined = $state();
@@ -362,8 +365,8 @@
   let effortDisabled = $derived(currentModelInfo?.supportsEffort !== true);
 
   let modelLabel = $derived.by(() => {
-    // Check platform models first, then CLI models
-    const all = [...(platformModels ?? []), ...getCliModels()];
+    // Check agent-specific models first, then platform/CLI models
+    const all = getModelsForAgent(agent, { platformModels, merge: true });
     const found = all.find((m) => m.value === model);
     if (found) return found.displayName;
     const fuzzy = all.find((m) => model.includes(m.value) && m.value !== "default");
@@ -612,6 +615,27 @@
           {t("statusbar_rewind")}
         </button>
       {/if}
+      {#if onCodexRewind}
+        <button
+          class="flex items-center gap-1 rounded px-2 py-0.5 text-foreground/50 hover:text-foreground hover:bg-accent transition-colors"
+          onclick={onCodexRewind}
+          title={t("codexRewind_buttonTitle")}
+        >
+          <svg
+            class="h-3 w-3"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            ><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path
+              d="M3 3v5h5"
+            /></svg
+          >
+          {t("statusbar_rewind")}
+        </button>
+      {/if}
       {#if onFork && run?.session_id}
         <button
           class="flex items-center gap-1 rounded px-2 py-0.5 text-foreground/50 hover:text-foreground hover:bg-accent transition-colors"
@@ -844,11 +868,15 @@
         {/if}
 
         {#if cliVersion}
-          <button
-            class="text-foreground/30 hover:text-foreground/60 transition-colors hidden sm:inline"
-            title={t("statusbar_cliVersionTitle", { version: cliVersion ?? "" })}
-            onclick={() => goto("/release-notes")}>CLI v{cliVersion}</button
-          >
+          {#if agent === "codex"}
+            <span class="text-foreground/30 hidden sm:inline">Codex v{cliVersion}</span>
+          {:else}
+            <button
+              class="text-foreground/30 hover:text-foreground/60 transition-colors hidden sm:inline"
+              title={t("statusbar_cliVersionTitle", { version: cliVersion ?? "" })}
+              onclick={() => goto("/release-notes")}>CLI v{cliVersion}</button
+            >
+          {/if}
         {/if}
       </div>
     </div>

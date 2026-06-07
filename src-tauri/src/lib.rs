@@ -8,6 +8,7 @@ pub mod storage;
 pub mod web_server;
 
 use agent::adapter::new_actor_session_map;
+use agent::codex_control::CodexInfoCache;
 use agent::control::CliInfoCache;
 use agent::spawn_locks::SpawnLocks;
 use agent::stream::new_process_map;
@@ -124,6 +125,7 @@ pub fn run() {
         .manage(new_process_map())
         .manage(new_actor_session_map())
         .manage(CliInfoCache::new())
+        .manage(CodexInfoCache::new())
         // Managed writer = the process-wide singleton, so the free-function
         // append_event path shares its per-run locks + seq source (audit #1).
         .manage(crate::storage::events::global_writer())
@@ -177,6 +179,7 @@ pub fn run() {
             commands::git::get_git_status,
             commands::export::export_conversation,
             commands::export::write_html_export,
+            commands::files::agents_md_exists,
             commands::files::read_text_file,
             commands::files::stat_text_file,
             commands::files::write_text_file,
@@ -188,6 +191,8 @@ pub fn run() {
             commands::stats::get_heatmap_daily,
             commands::stats::get_changelog,
             commands::diagnostics::check_agent_cli,
+            commands::diagnostics::check_codex_auth,
+            commands::diagnostics::run_codex_doctor,
             commands::diagnostics::test_remote_host,
             commands::diagnostics::get_cli_dist_tags,
             commands::diagnostics::check_project_init,
@@ -211,7 +216,9 @@ pub fn run() {
             commands::session::respond_permission,
             commands::session::respond_hook_callback,
             commands::session::respond_elicitation,
+            commands::session::respond_user_input,
             commands::control::get_cli_info,
+            commands::control::get_codex_models,
             commands::teams::list_teams,
             commands::teams::get_team_config,
             commands::teams::list_team_tasks,
@@ -236,6 +243,12 @@ pub fn run() {
             commands::plugins::create_skill,
             commands::plugins::update_skill,
             commands::plugins::delete_skill,
+            commands::plugins::list_codex_skills,
+            commands::plugins::create_codex_skill,
+            commands::plugins::delete_codex_skill,
+            commands::plugins::toggle_codex_skill,
+            commands::plugins::list_codex_installed_plugins,
+            commands::plugins::toggle_codex_plugin,
             commands::plugins::check_community_health,
             commands::plugins::search_community_skills,
             commands::plugins::get_community_skill_detail,
@@ -245,6 +258,7 @@ pub fn run() {
             commands::agents::create_agent_file,
             commands::agents::update_agent_file,
             commands::agents::delete_agent_file,
+            commands::agents::list_codex_agents,
             commands::clipboard::get_clipboard_files,
             commands::clipboard::read_clipboard_file,
             commands::clipboard::save_temp_attachment,
@@ -255,14 +269,25 @@ pub fn run() {
             commands::mcp::get_disabled_mcp_servers,
             commands::mcp::check_mcp_registry_health,
             commands::mcp::search_mcp_registry,
+            commands::mcp::list_codex_mcp_servers,
+            commands::mcp::add_codex_mcp_server,
+            commands::mcp::remove_codex_mcp_server,
             commands::cli_config::get_cli_config,
             commands::cli_config::get_project_cli_config,
             commands::cli_config::update_cli_config,
+            commands::cli_config::get_codex_config,
+            commands::cli_config::get_project_codex_config,
+            commands::cli_config::update_codex_config,
+            commands::cli_config::set_codex_feature,
+            commands::cli_config::get_codex_hooks,
+            commands::cli_config::update_codex_hooks,
             commands::cli_settings::get_cli_permissions,
             commands::cli_settings::update_cli_permissions,
             commands::onboarding::check_auth_status,
             commands::onboarding::detect_install_methods,
             commands::onboarding::run_claude_login,
+            commands::onboarding::run_codex_login,
+            commands::onboarding::run_codex_logout,
             commands::onboarding::get_auth_overview,
             commands::onboarding::set_cli_api_key,
             commands::onboarding::remove_cli_api_key,

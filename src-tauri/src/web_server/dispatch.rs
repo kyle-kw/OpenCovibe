@@ -216,6 +216,11 @@ pub async fn dispatch_command(
         }
 
         // ── Files ──
+        "agents_md_exists" => {
+            let cwd = extract_str(&params, "cwd")?;
+            let exists = crate::commands::files::agents_md_exists(cwd)?;
+            Ok(json!(exists))
+        }
         "read_text_file" => {
             let path = extract_str(&params, "path")?;
             let cwd = params.get("cwd").and_then(|v| v.as_str()).map(String::from);
@@ -398,6 +403,56 @@ pub async fn dispatch_command(
             crate::commands::plugins::delete_skill(path, cwd)?;
             Ok(json!(true))
         }
+        // ── Codex Skills ──
+        "list_codex_skills" => {
+            let cwd = params.get("cwd").and_then(|v| v.as_str()).map(String::from);
+            let result = crate::commands::plugins::list_codex_skills(cwd)?;
+            serde_json::to_value(result).map_err(|e| e.to_string())
+        }
+        "create_codex_skill" => {
+            let name = extract_str(&params, "name")?;
+            let description = extract_str(&params, "description")?;
+            let content = extract_str(&params, "content")?;
+            let scope = extract_str(&params, "scope")?;
+            let cwd = params.get("cwd").and_then(|v| v.as_str()).map(String::from);
+            let result = crate::commands::plugins::create_codex_skill(
+                name,
+                description,
+                content,
+                scope,
+                cwd,
+            )?;
+            serde_json::to_value(result).map_err(|e| e.to_string())
+        }
+        "delete_codex_skill" => {
+            let path = extract_str(&params, "path")?;
+            let cwd = params.get("cwd").and_then(|v| v.as_str()).map(String::from);
+            crate::commands::plugins::delete_codex_skill(path, cwd)?;
+            Ok(json!(true))
+        }
+        "toggle_codex_skill" => {
+            let skill_path = extract_str(&params, "skill_path")?;
+            let enabled = params
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let cwd = params.get("cwd").and_then(|v| v.as_str()).map(String::from);
+            crate::commands::plugins::toggle_codex_skill(skill_path, enabled, cwd)?;
+            Ok(json!(true))
+        }
+        "list_codex_installed_plugins" => {
+            let result = crate::commands::plugins::list_codex_installed_plugins().await?;
+            serde_json::to_value(result).map_err(|e| e.to_string())
+        }
+        "toggle_codex_plugin" => {
+            let plugin_id = extract_str(&params, "plugin_id")?;
+            let enabled = params
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| "enabled (bool) is required".to_string())?;
+            crate::commands::plugins::toggle_codex_plugin(plugin_id, enabled)?;
+            Ok(json!(true))
+        }
         "install_plugin" => {
             let name = extract_str(&params, "name")?;
             let scope = extract_str(&params, "scope")?;
@@ -497,6 +552,31 @@ pub async fn dispatch_command(
             let result = crate::commands::cli_config::update_cli_config(patch)?;
             Ok(result)
         }
+        // ── Codex Config (web dispatch) ──
+        "get_codex_config" => {
+            let result = crate::commands::cli_config::get_codex_config()?;
+            Ok(result)
+        }
+        "get_project_codex_config" => {
+            let cwd = extract_str(&params, "cwd")?;
+            let result = crate::commands::cli_config::get_project_codex_config(cwd)?;
+            Ok(result)
+        }
+        "update_codex_config" => {
+            let patch = params.get("patch").cloned().unwrap_or(params.clone());
+            let result = crate::commands::cli_config::update_codex_config(patch)?;
+            Ok(result)
+        }
+        // ── Codex Hooks ──
+        "get_codex_hooks" => {
+            let result = crate::commands::cli_config::get_codex_hooks()?;
+            Ok(result)
+        }
+        "update_codex_hooks" => {
+            let hooks = params.get("hooks").cloned().unwrap_or(params.clone());
+            let result = crate::commands::cli_config::update_codex_hooks(hooks)?;
+            Ok(json!(result))
+        }
 
         // ── CLI Permissions ──
         "get_cli_permissions" => {
@@ -571,6 +651,28 @@ pub async fn dispatch_command(
             let result = crate::commands::mcp::toggle_mcp_server_config(name, enabled, scope, cwd)?;
             serde_json::to_value(result).map_err(|e| e.to_string())
         }
+        // ── Codex MCP ──
+        "list_codex_mcp_servers" => {
+            let cwd = params.get("cwd").and_then(|v| v.as_str()).map(String::from);
+            let result = crate::commands::mcp::list_codex_mcp_servers(cwd)?;
+            serde_json::to_value(result).map_err(|e| e.to_string())
+        }
+        "add_codex_mcp_server" => {
+            let name = extract_str(&params, "name")?;
+            let config = params
+                .get("config")
+                .cloned()
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            let result = crate::commands::mcp::add_codex_mcp_server(name, config)?;
+            serde_json::to_value(result).map_err(|e| e.to_string())
+        }
+        "remove_codex_mcp_server" => {
+            let name = extract_str(&params, "name")?;
+            let scope = extract_str(&params, "scope")?;
+            let cwd = params.get("cwd").and_then(|v| v.as_str()).map(String::from);
+            let result = crate::commands::mcp::remove_codex_mcp_server(name, scope, cwd)?;
+            serde_json::to_value(result).map_err(|e| e.to_string())
+        }
         "check_mcp_registry_health" => {
             let result = crate::commands::mcp::check_mcp_registry_health().await?;
             serde_json::to_value(result).map_err(|e| e.to_string())
@@ -593,6 +695,10 @@ pub async fn dispatch_command(
         "check_agent_cli" => {
             let agent = extract_str(&params, "agent")?;
             let result = crate::commands::diagnostics::check_agent_cli(agent).await?;
+            serde_json::to_value(result).map_err(|e| e.to_string())
+        }
+        "check_codex_auth" => {
+            let result = crate::commands::diagnostics::check_codex_auth().await?;
             serde_json::to_value(result).map_err(|e| e.to_string())
         }
         "check_project_init" => {
@@ -701,7 +807,8 @@ pub async fn dispatch_command(
             serde_json::to_value(result).map_err(|e| e.to_string())
         }
         "detect_install_methods" => {
-            let result = crate::commands::onboarding::detect_install_methods().await?;
+            let agent = extract_str(&params, "agent").unwrap_or_else(|_| "claude".into());
+            let result = crate::commands::onboarding::detect_install_methods(agent).await?;
             serde_json::to_value(result).map_err(|e| e.to_string())
         }
         "get_auth_overview" => {
@@ -722,6 +829,10 @@ pub async fn dispatch_command(
         "list_agents" => {
             let cwd = params.get("cwd").and_then(|v| v.as_str()).map(String::from);
             let result = crate::commands::agents::list_agents(cwd).await?;
+            serde_json::to_value(result).map_err(|e| e.to_string())
+        }
+        "list_codex_agents" => {
+            let result = crate::commands::agents::list_codex_agents()?;
             serde_json::to_value(result).map_err(|e| e.to_string())
         }
         "read_agent_file" => {
@@ -758,7 +869,11 @@ pub async fn dispatch_command(
         // ── CLI Sync ──
         "discover_cli_sessions" => {
             let cwd = extract_str(&params, "cwd")?;
-            let result = crate::commands::cli_sync::discover_cli_sessions(cwd).await?;
+            let agent = params
+                .get("agent")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let result = crate::commands::cli_sync::discover_cli_sessions(cwd, agent).await?;
             serde_json::to_value(result).map_err(|e| e.to_string())
         }
 
@@ -856,6 +971,7 @@ pub async fn dispatch_command(
                 .send(ActorCommand::SendMessage {
                     text: message,
                     attachments,
+                    skills: Vec::new(),
                     reply: reply_tx,
                 })
                 .await
@@ -1142,9 +1258,14 @@ pub async fn dispatch_command(
         // ── CLI Sync (additional) ──
         "sync_cli_session" => {
             let run_id = extract_str(&params, "run_id")?;
+            // Dispatch by RunMeta.agent — Codex runs use codex_sessions::sync_session.
+            let meta = crate::storage::runs::get_run(&run_id)
+                .ok_or_else(|| format!("run {} not found", run_id))?;
+            let agent = meta.agent.clone();
             let writer = state.writer.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                crate::storage::cli_sessions::sync_session(&run_id, writer)
+            let result = tokio::task::spawn_blocking(move || match agent.as_str() {
+                "codex" => crate::storage::codex_sessions::sync_session(&run_id, writer),
+                _ => crate::storage::cli_sessions::sync_session(&run_id, writer),
             })
             .await
             .map_err(|e| format!("spawn_blocking: {}", e))?;
@@ -1154,9 +1275,17 @@ pub async fn dispatch_command(
         "import_cli_session" => {
             let session_id = extract_str(&params, "session_id")?;
             let cwd = extract_str(&params, "cwd")?;
+            let agent = params
+                .get("agent")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| "claude".to_string());
             let writer = state.writer.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                crate::storage::cli_sessions::import_session(&session_id, &cwd, writer)
+            let result = tokio::task::spawn_blocking(move || match agent.as_str() {
+                "codex" => {
+                    crate::storage::codex_sessions::import_session(&session_id, &cwd, writer)
+                }
+                _ => crate::storage::cli_sessions::import_session(&session_id, &cwd, writer),
             })
             .await
             .map_err(|e| format!("spawn_blocking: {}", e))?;
@@ -1169,6 +1298,8 @@ pub async fn dispatch_command(
         | "update_screenshot_hotkey"
         | "get_clipboard_files"
         | "run_claude_login"
+        | "run_codex_login"
+        | "run_codex_logout"
         | "check_for_updates"
         | "send_chat_message" => Err("desktop only".to_string()),
 

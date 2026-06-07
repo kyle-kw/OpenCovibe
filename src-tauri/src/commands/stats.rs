@@ -19,7 +19,110 @@ fn parse_started_date_utc(started_at: &str) -> Option<chrono::NaiveDate> {
 #[tauri::command]
 pub fn get_global_usage_overview(days: Option<u32>) -> Result<UsageOverview, String> {
     log::debug!("[stats] get_global_usage_overview: days={:?}", days);
-    storage::claude_usage::read_global_usage(days)
+    let claude = storage::claude_usage::read_global_usage(days)?;
+    // Codex sessions live in ~/.codex/sessions (parallel to ~/.claude/projects). Merge so
+    // Global covers both agents. Codex failures degrade gracefully to Claude-only.
+    match storage::codex_usage::read_global_codex_usage(days) {
+        Ok(codex) => Ok(merge_overviews(claude, codex)),
+        Err(e) => {
+            log::warn!("[stats] codex global usage failed: {}, claude-only", e);
+            Ok(claude)
+        }
+    }
+}
+
+/// Merge two global UsageOverviews (Claude + Codex) into one. Totals add; by-model and
+/// daily aggregate by key. Activity/streaks keep Claude's (primary) — Codex-only-active
+/// days are not yet folded into the streak count.
+fn merge_overviews(a: UsageOverview, b: UsageOverview) -> UsageOverview {
+    let total_cost = a.total_cost_usd + b.total_cost_usd;
+    let total_tokens = a.total_tokens + b.total_tokens;
+    let total_runs = a.total_runs + b.total_runs;
+
+    // by_model: aggregate by model name (Claude/Codex names are distinct in practice).
+    let mut model_map: HashMap<String, ModelAggregate> = HashMap::new();
+    for m in a.by_model.into_iter().chain(b.by_model) {
+        let e = model_map
+            .entry(m.model.clone())
+            .or_insert_with(|| ModelAggregate {
+                model: m.model.clone(),
+                runs: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cost_usd: 0.0,
+                pct: 0.0,
+            });
+        e.runs += m.runs;
+        e.input_tokens += m.input_tokens;
+        e.output_tokens += m.output_tokens;
+        e.cache_read_tokens += m.cache_read_tokens;
+        e.cache_write_tokens += m.cache_write_tokens;
+        e.cost_usd += m.cost_usd;
+    }
+    let mut by_model: Vec<ModelAggregate> = model_map.into_values().collect();
+    for m in &mut by_model {
+        m.pct = if total_cost > 0.0 {
+            m.cost_usd / total_cost * 100.0
+        } else {
+            0.0
+        };
+    }
+    by_model.sort_by(|x, y| {
+        y.cost_usd
+            .partial_cmp(&x.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // daily: merge by date. Keep Claude's message/session/tool counts + model_breakdown
+    // (Codex daily has none); sum cost/tokens so the daily-trend chart covers both.
+    let mut day_map: HashMap<String, DailyAggregate> = HashMap::new();
+    for d in a.daily.into_iter().chain(b.daily) {
+        match day_map.get_mut(&d.date) {
+            Some(e) => {
+                e.cost_usd += d.cost_usd;
+                e.runs += d.runs;
+                e.input_tokens += d.input_tokens;
+                e.output_tokens += d.output_tokens;
+                if e.message_count.is_none() {
+                    e.message_count = d.message_count;
+                }
+                if e.session_count.is_none() {
+                    e.session_count = d.session_count;
+                }
+                if e.tool_call_count.is_none() {
+                    e.tool_call_count = d.tool_call_count;
+                }
+                if e.model_breakdown.is_none() {
+                    e.model_breakdown = d.model_breakdown;
+                }
+            }
+            None => {
+                day_map.insert(d.date.clone(), d);
+            }
+        }
+    }
+    let mut daily: Vec<DailyAggregate> = day_map.into_values().collect();
+    daily.sort_by(|x, y| x.date.cmp(&y.date));
+
+    UsageOverview {
+        total_cost_usd: total_cost,
+        total_tokens,
+        total_runs,
+        avg_cost_per_run: if total_runs > 0 {
+            total_cost / total_runs as f64
+        } else {
+            0.0
+        },
+        by_model,
+        daily,
+        runs: a.runs,
+        scan_mode: a.scan_mode,
+        active_days: a.active_days,
+        current_streak: a.current_streak,
+        longest_streak: a.longest_streak,
+    }
 }
 
 /// Per-model aggregate builder (internal, not serialized).
@@ -76,28 +179,69 @@ pub fn get_usage_overview(days: Option<u32>) -> Result<UsageOverview, String> {
         // Extract usage from events.jsonl
         let usage = storage::events::extract_run_usage(&meta.id);
 
-        let cost = usage.as_ref().map(|u| u.total_cost_usd).unwrap_or(0.0);
+        let mut cost = usage.as_ref().map(|u| u.total_cost_usd).unwrap_or(0.0);
         // total_tokens = input + output (billable tokens only, not cache)
         let tokens = usage
             .as_ref()
             .map(|u| u.input_tokens + u.output_tokens)
             .unwrap_or(0);
-
-        total_cost += cost;
-        total_tokens += tokens;
+        let mut cost_estimated = false;
 
         // Build per-model aggregates
         if let Some(ref u) = usage {
-            for (model, mu) in &u.model_usage {
-                let agg = model_map.entry(model.clone()).or_default();
-                agg.runs += 1;
-                agg.input_tokens += mu.input_tokens;
-                agg.output_tokens += mu.output_tokens;
-                agg.cache_read_tokens += mu.cache_read_tokens;
-                agg.cache_write_tokens += mu.cache_write_tokens;
-                agg.cost_usd += mu.cost_usd;
+            if !u.model_usage.is_empty() {
+                // Claude: CLI provides per-model breakdown
+                for (model, mu) in &u.model_usage {
+                    let agg = model_map.entry(model.clone()).or_default();
+                    agg.runs += 1;
+                    agg.input_tokens += mu.input_tokens;
+                    agg.output_tokens += mu.output_tokens;
+                    agg.cache_read_tokens += mu.cache_read_tokens;
+                    agg.cache_write_tokens += mu.cache_write_tokens;
+                    agg.cost_usd += mu.cost_usd;
+                }
+            } else if meta.agent == "codex"
+                && (u.input_tokens > 0 || u.output_tokens > 0)
+                && meta.model.is_some()
+            {
+                // Codex with known model: estimate cost from tokens + pricing table.
+                // try_estimate_cost returns None for unknown models (e.g. gpt-oss-*)
+                // so we don't produce wrong estimates via the Sonnet fallback.
+                let model_name = meta.model.as_deref().unwrap();
+                let estimated = crate::pricing::try_estimate_cost(
+                    model_name,
+                    u.input_tokens,
+                    u.output_tokens,
+                    u.cache_read_tokens,
+                    u.cache_write_tokens,
+                );
+                if let Some(est) = estimated {
+                    if cost < 0.000001 && est > 0.0 {
+                        cost = est;
+                        cost_estimated = true;
+                    }
+                    // Synthesize single-model entry for by-model table
+                    let agg = model_map.entry(model_name.to_string()).or_default();
+                    agg.runs += 1;
+                    agg.input_tokens += u.input_tokens;
+                    agg.output_tokens += u.output_tokens;
+                    agg.cache_read_tokens += u.cache_read_tokens;
+                    agg.cache_write_tokens += u.cache_write_tokens;
+                    agg.cost_usd += est;
+                } else {
+                    // Unknown model: still show in by-model table but with $0 cost
+                    let agg = model_map.entry(model_name.to_string()).or_default();
+                    agg.runs += 1;
+                    agg.input_tokens += u.input_tokens;
+                    agg.output_tokens += u.output_tokens;
+                    agg.cache_read_tokens += u.cache_read_tokens;
+                    agg.cache_write_tokens += u.cache_write_tokens;
+                }
             }
         }
+
+        total_cost += cost;
+        total_tokens += tokens;
 
         // Build daily aggregates
         let date = started_date.format("%Y-%m-%d").to_string();
@@ -135,6 +279,7 @@ pub fn get_usage_overview(days: Option<u32>) -> Result<UsageOverview, String> {
                 .as_ref()
                 .map(|u| u.model_usage.clone())
                 .unwrap_or_default(),
+            cost_estimated,
         });
     }
 
@@ -293,7 +438,8 @@ pub fn get_heatmap_daily(scope: String) -> Result<Vec<DailyAggregate>, String> {
     log::debug!("[stats] get_heatmap_daily: scope={}", scope);
     let raw = match scope.as_str() {
         "global" => {
-            let overview = storage::claude_usage::read_global_usage(Some(365))?;
+            // Merge Claude + Codex daily so the global heatmap reflects both agents.
+            let overview = get_global_usage_overview(Some(365))?;
             overview.daily
         }
         "app" => get_app_heatmap_daily()?,

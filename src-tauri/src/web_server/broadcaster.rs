@@ -190,6 +190,8 @@ fn event_type_name(event: &BusEvent) -> &'static str {
         BusEvent::HookCallback { .. } => "hook_callback",
         BusEvent::TaskNotification { .. } => "task_notification",
         BusEvent::ToolProgress { .. } => "tool_progress",
+        BusEvent::ToolOutputDelta { .. } => "tool_output_delta",
+        BusEvent::GoalUpdate { .. } => "goal_update",
         BusEvent::ToolUseSummary { .. } => "tool_use_summary",
         BusEvent::FilesPersisted { .. } => "files_persisted",
         BusEvent::ControlCancelled { .. } => "control_cancelled",
@@ -199,6 +201,9 @@ fn event_type_name(event: &BusEvent) -> &'static str {
         BusEvent::RalphStarted { .. } => "ralph_started",
         BusEvent::RalphIteration { .. } => "ralph_iteration",
         BusEvent::RalphComplete { .. } => "ralph_complete",
+        BusEvent::CodexHookRun { .. } => "codex_hook_run",
+        BusEvent::CodexMcpStatus { .. } => "codex_mcp_status",
+        BusEvent::CodexTurnDiff { .. } => "codex_turn_diff",
         BusEvent::Raw { .. } => "raw",
     }
 }

@@ -76,6 +76,7 @@ export const VIRTUAL_COMMANDS: CliCommand[] = [
     _virtual: true,
     _enum: true,
     argumentHint: "",
+    // No hot-switch for Codex — model change takes effect on next turn
   },
   {
     name: "config",
@@ -105,6 +106,7 @@ export const VIRTUAL_COMMANDS: CliCommand[] = [
     _virtual: true,
     _action: "toggle-plan",
     argumentHint: "[instructions]",
+    // Codex: mode takes effect next turn (--sandbox read-only / default / bypass)
   },
   {
     name: "rename",
@@ -163,6 +165,7 @@ export const VIRTUAL_COMMANDS: CliCommand[] = [
     aliases: [],
     _virtual: true,
     _action: "add-dir",
+    // Codex: saves to settings, takes effect next turn (--add-dir flag)
   },
   {
     name: "fast",
@@ -171,6 +174,7 @@ export const VIRTUAL_COMMANDS: CliCommand[] = [
     _virtual: true,
     _enum: true,
     _action: "toggle-fast",
+    _excludeAgents: ["codex"], // Claude-specific
   },
   {
     name: "rewind",
@@ -178,6 +182,52 @@ export const VIRTUAL_COMMANDS: CliCommand[] = [
     aliases: ["undo"],
     _virtual: true,
     _action: "rewind",
+    _excludeAgents: ["codex"], // needs snapshots
+  },
+  {
+    name: "rewind",
+    // Codex variant: turn-based history rollback (drops N turns), NOT a file
+    // snapshot rewind. Distinct entry so the Claude variant's snapshot copy/
+    // exclusion stays intact. Resolved per-agent by parseVirtualAction.
+    description: "Rewind conversation to an earlier turn (history only)",
+    aliases: ["undo"],
+    _virtual: true,
+    _action: "codex-rewind",
+    _excludeAgents: ["claude"],
+  },
+  {
+    name: "compact",
+    // Codex `thread/compact/start`: summarize + clear history, keep going.
+    // Claude CLI returns its own /compact (passthrough), so Codex-only here.
+    description: "Clear conversation history but keep a summary in context",
+    aliases: [],
+    _virtual: true,
+    _action: "codex-compact",
+    _excludeAgents: ["claude"],
+  },
+  {
+    name: "goal",
+    // Codex `thread/goal/*`: set an objective + token budget and watch live
+    // progress. No Claude equivalent.
+    description: "Set or view the session objective and token budget",
+    aliases: [],
+    _virtual: true,
+    _action: "codex-goal",
+    _excludeAgents: ["claude"],
+  },
+  {
+    name: "clear",
+    // Codex parity: `/new`, `/exit`, `/quit` are aliases — all fall through to the
+    // same clear-context action. In a GUI app "exit"/"quit" mean leave the current
+    // chat (not quit the app), which matches clear semantics. Gated to Codex so we
+    // don't silently intercept these names on Claude, whose CLI owns /exit and /quit
+    // (and has no /new) — there they fall through to CLI passthrough.
+    // Listed before the agent-neutral entry so Codex's merged menu surfaces the aliases.
+    description: "Clear conversation history and free up context",
+    aliases: ["new", "exit", "quit"],
+    _virtual: true,
+    _action: "clear-context",
+    _excludeAgents: ["claude"],
   },
   {
     name: "clear",
@@ -185,6 +235,7 @@ export const VIRTUAL_COMMANDS: CliCommand[] = [
     aliases: [],
     _virtual: true,
     _action: "clear-context",
+    // Codex: navigates to fresh chat (new thread on next message)
   },
   {
     name: "permissions",
@@ -192,6 +243,7 @@ export const VIRTUAL_COMMANDS: CliCommand[] = [
     aliases: [],
     _virtual: true,
     _action: "open-permissions",
+    _excludeAgents: ["codex"], // Claude permission mode
   },
   {
     name: "plugin",
@@ -201,12 +253,146 @@ export const VIRTUAL_COMMANDS: CliCommand[] = [
     _navigate: "/plugins",
   },
   {
+    name: "mcp",
+    description: "Manage MCP servers",
+    aliases: [],
+    _virtual: true,
+    _navigate: "/plugins?section=mcp&source=configured",
+    // Intentional behaviour change: even when Claude CLI passes through /mcp,
+    // OpenCovibe intercepts and opens the in-app Extend page. Same pattern as
+    // /memory — the app owns this UI rather than delegating to CLI TUI.
+  },
+  {
+    name: "agents",
+    description: "Manage agent configurations",
+    // Singular `/agent` removed (was wave 2 alias). Codex TUI's `/agent`
+    // opens a sub-agent picker — a completely different semantic — so
+    // routing /agent to the Extend page was misleading. Codex /agent now
+    // has its own informative virtual; /agents (plural) stays here.
+    aliases: [],
+    _virtual: true,
+    _navigate: "/plugins?section=agents",
+  },
+  {
+    name: "hooks",
+    description: "Manage hook configurations",
+    aliases: [],
+    _virtual: true,
+    _navigate: "/plugins?section=hooks",
+  },
+  {
+    name: "skills",
+    description: "Browse and manage skills",
+    aliases: [],
+    _virtual: true,
+    _navigate: "/plugins?section=skills&source=installed",
+  },
+  {
+    name: "resume",
+    // Honest framing: navigates to /history rather than auto-resuming the
+    // most recent session (Codex TUI's /resume picks last). Users choose.
+    description: "Open conversation history to resume a previous chat",
+    aliases: [],
+    _virtual: true,
+    _navigate: "/history",
+  },
+  {
+    name: "theme",
+    description: "Change the theme",
+    aliases: [],
+    _virtual: true,
+    // Theme controls live within General tab (SettingsTab union has no
+    // separate `appearance`). Verified at settings/+page.svelte:45,734.
+    _navigate: "/settings?tab=general",
+  },
+  {
+    name: "feedback",
+    description: "Open the OpenCovibe issue tracker",
+    aliases: [],
+    _virtual: true,
+    _action: "open-feedback",
+  },
+  {
+    name: "agent",
+    description: "Switch active sub-agent thread (Codex sub-agent picker)",
+    aliases: [],
+    _virtual: true,
+    _action: "codex-agent-info",
+    // Codex TUI /agent opens OpenAgentPicker — a sub-agent picker. OpenCovibe
+    // doesn't have that picker UI yet (sub-agents currently nest inline as
+    // Agent tool calls in the timeline). This virtual emits an explainer
+    // rather than misroute users to the Extend Agents config page.
+    // Claude CLI has no singular /agent command; only Codex.
+    _excludeAgents: ["claude"],
+  },
+  {
+    name: "review",
+    description: "Review uncommitted changes for bugs and improvements",
+    aliases: [],
+    _virtual: true,
+    _action: "codex-review",
+    // Claude CLI has its own /review (PR / security review) that we leave to
+    // CLI passthrough. Codex exec mode has no slash dispatch, so we inject
+    // a review prompt at the app layer.
+    _excludeAgents: ["claude"],
+  },
+  {
+    name: "btw",
+    // Codex parity: Codex CLI names this `/side`. Gated to Codex so the `/side`
+    // alias isn't intercepted on Claude (where it has no native meaning and would
+    // otherwise shadow CLI passthrough). The canonical `/btw` stays on both agents.
+    // Listed before the agent-neutral entry so Codex's merged menu surfaces the alias.
+    description: "Ask a side question without interrupting the current task",
+    aliases: ["side"],
+    _virtual: true,
+    _action: "side-question",
+    argumentHint: "<question>",
+    _excludeAgents: ["claude"],
+  },
+  {
     name: "btw",
     description: "Ask a side question without interrupting the current task",
     aliases: [],
     _virtual: true,
     _action: "side-question",
     argumentHint: "<question>",
+    // Codex: ephemeral single-shot (no fork, read-only sandbox)
+  },
+  {
+    name: "init",
+    description: "Create an AGENTS.md with project instructions",
+    aliases: [],
+    _virtual: true,
+    _action: "init-project",
+    // Claude CLI handles /init itself (writes CLAUDE.md). For Codex (exec mode),
+    // OpenCovibe replicates Codex TUI's /init: inject upstream init prompt.
+    _excludeAgents: ["claude"],
+  },
+  {
+    name: "memory",
+    description: "Edit project memory files (CLAUDE.md / AGENTS.md)",
+    // Codex parity: `/memories` is an alias (Codex TUI uses the plural).
+    aliases: ["memories"],
+    _virtual: true,
+    _navigate: "/memory",
+  },
+  {
+    name: "login",
+    description: "Sign in to Codex",
+    aliases: [],
+    _virtual: true,
+    _action: "codex-login",
+    // Claude CLI's /login is handled by Claude itself (interactive TUI).
+    // OpenCovibe only intervenes for Codex (exec mode has no slash dispatch).
+    _excludeAgents: ["claude"],
+  },
+  {
+    name: "logout",
+    description: "Sign out of Codex",
+    aliases: [],
+    _virtual: true,
+    _action: "codex-logout",
+    _excludeAgents: ["claude"],
   },
   {
     name: "stickers",
@@ -218,7 +404,8 @@ export const VIRTUAL_COMMANDS: CliCommand[] = [
   {
     name: "keybindings",
     description: "Open keybindings settings",
-    aliases: [],
+    // Codex CLI names this `/keymap`; we accept both.
+    aliases: ["keymap"],
     _virtual: true,
     _navigate: "/settings?tab=shortcuts",
   },
@@ -237,6 +424,8 @@ export const VIRTUAL_COMMANDS: CliCommand[] = [
     _virtual: true,
     _action: "start-ralph-loop",
     argumentHint: "<prompt> [--max-iterations N] [--completion-promise TEXT]",
+    // session_actor Ralph binds stream-session; Codex pipe-exec path not yet implemented
+    _excludeAgents: ["codex"],
   },
   {
     name: "cancel-ralph",
@@ -244,8 +433,45 @@ export const VIRTUAL_COMMANDS: CliCommand[] = [
     aliases: ["stop-ralph"],
     _virtual: true,
     _action: "cancel-ralph-loop",
+    _excludeAgents: ["codex"],
   },
 ];
+
+// ── Agent exclusion helpers ──
+
+function isExcludedForAgent(cmd: CliCommand, agent: string): boolean {
+  const excluded = cmd["_excludeAgents"];
+  return Array.isArray(excluded) && excluded.includes(agent);
+}
+
+/**
+ * Resolve a virtual command name/alias to the agent-correct variant.
+ * Some names (rewind, compact, …) have per-agent variants distinguished only by
+ * `_excludeAgents`; this returns the first one NOT excluded for `agent` so callers
+ * dispatch the right `_action` (e.g. Codex /rewind → "codex-rewind", not "rewind").
+ */
+export function resolveVirtualCommand(
+  name: string,
+  agent: string = "claude",
+): CliCommand | undefined {
+  const lname = name.toLowerCase();
+  const candidates = VIRTUAL_COMMANDS.filter(
+    (v) =>
+      v.name.toLowerCase() === lname || (v.aliases ?? []).some((a) => a.toLowerCase() === lname),
+  );
+  return candidates.find((v) => !isExcludedForAgent(v, agent));
+}
+
+/** Known virtual command names+aliases for an agent (for isKnownSlashCommand). */
+export function getKnownVirtualNames(agent: string): Set<string> {
+  const result = new Set<string>();
+  for (const v of VIRTUAL_COMMANDS) {
+    if (isExcludedForAgent(v, agent)) continue;
+    result.add(v.name.toLowerCase());
+    for (const a of v.aliases ?? []) result.add(a.toLowerCase());
+  }
+  return result;
+}
 
 /**
  * Parse /loop command arguments.
@@ -311,10 +537,14 @@ export function mergeProjectCommands(
  * (CLI fields take priority for name/desc/aliases). Append remaining virtuals.
  * Commands with empty descriptions get a fallback from KNOWN_COMMAND_DESCRIPTIONS.
  */
-export function mergeWithVirtual(cliCommands: CliCommand[]): CliCommand[] {
+export function mergeWithVirtual(
+  cliCommands: CliCommand[],
+  agent: string = "claude",
+): CliCommand[] {
+  const applicableVirtuals = VIRTUAL_COMMANDS.filter((v) => !isExcludedForAgent(v, agent));
   const cliMap = new Map(cliCommands.map((c) => [c.name, c]));
   const result = cliCommands.map((c) => {
-    const virtual = VIRTUAL_COMMANDS.find((v) => v.name === c.name);
+    const virtual = applicableVirtuals.find((v) => v.name === c.name);
     let merged = virtual
       ? { ...virtual, ...c, _virtual: true, _enum: virtual["_enum"] ?? false }
       : c;
@@ -330,9 +560,15 @@ export function mergeWithVirtual(cliCommands: CliCommand[]): CliCommand[] {
     }
     return merged;
   });
-  // Append virtuals not present in CLI
-  for (const v of VIRTUAL_COMMANDS) {
-    if (!cliMap.has(v.name)) result.push(v);
+  // Append virtuals not present in CLI. Some names have multiple applicable
+  // variants for one agent (e.g. Codex's base `clear` + the alias-carrying
+  // `clear`); append only the first so the menu shows no duplicate entries.
+  const appended = new Set<string>();
+  for (const v of applicableVirtuals) {
+    if (!cliMap.has(v.name) && !appended.has(v.name)) {
+      result.push(v);
+      appended.add(v.name);
+    }
   }
   return result;
 }
@@ -345,12 +581,18 @@ export function isVirtualCommand(cmd: CliCommand): boolean {
  * Parse a virtual command invocation from send text.
  * Returns `{ name, args }` if the text matches a virtual command, else null.
  */
-export function parseVirtualAction(text: string): { name: string; args: string } | null {
+export function parseVirtualAction(
+  text: string,
+  agent: string = "claude",
+): { name: string; args: string } | null {
   const match = text.match(/^\/(\S+)(?:\s+(.*))?$/);
   if (!match) return null;
   const name = match[1];
-  const virtual = VIRTUAL_COMMANDS.find((v) => v.name === name || (v.aliases ?? []).includes(name));
-  if (!virtual) return null;
+  // Some names (rewind, compact) have per-agent variants — resolve to the variant
+  // that ISN'T excluded for this agent so e.g. Codex /rewind resolves to the
+  // turn-based variant rather than short-circuiting on the Claude snapshot one.
+  const virtual = resolveVirtualCommand(name, agent);
+  if (!virtual) return null; // unknown, or all variants excluded for this agent
   return { name: virtual.name, args: (match[2] ?? "").trim() };
 }
 
@@ -445,7 +687,7 @@ export function extractSlashQuery(inputText: string): string | null {
 // ── Quick action pills (L3) ──
 
 /** Ordered list of command names shown as quick-action pills above the action bar. */
-export const QUICK_ACTION_NAMES: readonly string[] = [
+const CLAUDE_QUICK_ACTIONS: readonly string[] = [
   "compact",
   "copy",
   "model",
@@ -454,10 +696,22 @@ export const QUICK_ACTION_NAMES: readonly string[] = [
   "clear",
 ] as const;
 
-/** Return the subset of allCommands that appear in QUICK_ACTION_NAMES, preserving pill order. */
-export function getQuickActions(allCommands: CliCommand[]): CliCommand[] {
+const CODEX_QUICK_ACTIONS: readonly string[] = [
+  "compact",
+  "copy",
+  "diff",
+  "status",
+  "stats",
+] as const;
+
+/** @deprecated Use getQuickActions(allCommands, agent) instead. */
+export const QUICK_ACTION_NAMES: readonly string[] = CLAUDE_QUICK_ACTIONS;
+
+/** Return the subset of allCommands that appear in quick-action list, preserving pill order. */
+export function getQuickActions(allCommands: CliCommand[], agent: string = "claude"): CliCommand[] {
+  const names = agent === "codex" ? CODEX_QUICK_ACTIONS : CLAUDE_QUICK_ACTIONS;
   const map = new Map(allCommands.map((c) => [c.name, c]));
-  return QUICK_ACTION_NAMES.filter((n) => map.has(n)).map((n) => map.get(n)!);
+  return names.filter((n) => map.has(n)).map((n) => map.get(n)!);
 }
 
 // ── Slash command categories (grouped menu) ──
@@ -483,6 +737,8 @@ const COMMAND_CATEGORY_MAP: Record<string, SlashCategory> = {
   cost: "session",
   resume: "session",
   fork: "session",
+  rewind: "session",
+  goal: "session",
   btw: "session",
   loop: "session",
   copy: "session",

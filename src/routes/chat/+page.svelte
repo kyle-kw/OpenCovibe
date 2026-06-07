@@ -12,11 +12,16 @@
     getCliCurrentModel,
     getCliCommands,
     getCliModels,
+    getModelsForAgent,
+    getCodexDefaultModel,
+    loadCodexModels,
+    loadCodexModelsLive,
     canResumeNow,
     TERMINAL_PHASES,
     getResumeWarning,
     loadCliVersionInfo,
     getCliVersionInfo_cached,
+    getCodexVersion,
   } from "$lib/stores";
   import type {
     Attachment,
@@ -30,6 +35,8 @@
     TimelineEntry,
   } from "$lib/types";
   import { PLATFORM_PRESETS, findCredential } from "$lib/utils/platform-presets";
+  import { isKnownAgent, getAgentFeatures } from "$lib/utils/agent-features";
+  import { IS_WEBKIT } from "$lib/utils/platform";
   import {
     detectBatchGroups,
     detectToolBursts,
@@ -48,17 +55,22 @@
   import ToolBurstHeader from "$lib/components/ToolBurstHeader.svelte";
   import SessionStatusBar from "$lib/components/SessionStatusBar.svelte";
   import McpStatusPanel from "$lib/components/McpStatusPanel.svelte";
+  import FeaturesPanel from "$lib/components/FeaturesPanel.svelte";
+  import DiffModal from "$lib/components/DiffModal.svelte";
   import PromptInput from "$lib/components/PromptInput.svelte";
   import ScheduledTasksChip from "$lib/components/ScheduledTasksChip.svelte";
+  import TodoPanel from "$lib/components/TodoPanel.svelte";
   import PermissionPanel from "$lib/components/PermissionPanel.svelte";
   import ElicitationDialog from "$lib/components/ElicitationDialog.svelte";
-  import AuthSourceBadge from "$lib/components/AuthSourceBadge.svelte";
+  import AgentAuthBadge from "$lib/components/AgentAuthBadge.svelte";
+  import AgentSelector from "$lib/components/AgentSelector.svelte";
 
   import ToolActivity from "$lib/components/ToolActivity.svelte";
   import ShortcutHelpPanel from "$lib/components/ShortcutHelpPanel.svelte";
   import type { PromptInputSnapshot } from "$lib/types";
   import MarkdownContent from "$lib/components/MarkdownContent.svelte";
   import HookReviewCard from "$lib/components/HookReviewCard.svelte";
+  import HookExecutionCard from "$lib/components/HookExecutionCard.svelte";
   import ContextUsageGrid from "$lib/components/ContextUsageGrid.svelte";
   import CostSummaryView from "$lib/components/CostSummaryView.svelte";
   import { parseContextMarkdown } from "$lib/utils/context-parser";
@@ -85,8 +97,21 @@
     buildHelpText,
     CONTEXT_CLEARED_MARKER,
     parseRalphArgs,
+    VIRTUAL_COMMANDS,
   } from "$lib/utils/slash-commands";
   import { executeAddDir } from "$lib/utils/add-dir";
+  import { CODEX_INIT_PROMPT } from "$lib/utils/codex-init-prompt";
+  import {
+    CODEX_REVIEW_UNCOMMITTED_PROMPT,
+    codexReviewBasePrompt,
+    codexReviewCommitPrompt,
+    codexReviewCustomPrompt,
+  } from "$lib/utils/codex-review-prompt";
+  import CodexReviewModal from "$lib/components/CodexReviewModal.svelte";
+  import type { CodexReviewKind } from "$lib/components/CodexReviewModal.svelte";
+  import RewindCodexModal from "$lib/components/RewindCodexModal.svelte";
+  import type { RewindTurn } from "$lib/components/RewindCodexModal.svelte";
+  import GoalPanel from "$lib/components/GoalPanel.svelte";
   import { buildDoctorReport } from "$lib/utils/doctor";
   import type { RewindCandidate, RewindMarker } from "$lib/utils/rewind";
   import { truncate, cwdDisplayLabel, formatTokenCount } from "$lib/utils/format";
@@ -98,6 +123,12 @@
   import { isElementSelection } from "$lib/types";
 
   // ── Helpers ──
+
+  /** Sanitize Codex run.model: if it looks like a Claude model name, return empty. */
+  function codexDisplayModel(model?: string): string {
+    if (!model) return "";
+    return /claude|opus|sonnet|haiku/i.test(model) ? "" : model;
+  }
 
   // ── Layout context ──
   const toggleLayoutSidebar = getContext<() => void>("toggleSidebar");
@@ -156,6 +187,11 @@
   }
   /** Preloaded skill details from filesystem (has descriptions). */
   let preloadedSkills = $state<import("$lib/types").StandaloneSkill[]>([]);
+  /** Skills the live Codex agent actually loaded this session (name + path), from the app-server
+   *  `skills/list` runtime query. `path` is required to send a skill as a structured
+   *  {type:"skill"} UserInput. Empty unless there's a live Codex session — the composer skill
+   *  picker is gated on this being non-empty so we never offer a skill we can't actually send. */
+  let codexRuntimeSkills = $state<{ name: string; path: string; description: string }[]>([]);
   /** Preloaded agent definitions from filesystem. */
   let preloadedAgents = $state<import("$lib/types").AgentDefinitionSummary[]>([]);
   /** Project-level commands from {cwd}/.claude/commands/ + ~/.claude/commands/. */
@@ -164,6 +200,10 @@
   let preloadGen = 0;
   /** Local proxy running statuses for AuthSourceBadge. */
   let localProxyStatuses = $state<Record<string, { running: boolean; needsAuth: boolean }>>({});
+
+  // ── Codex auth warning ──
+  let codexWarning = $state<string | null>(null);
+  let agentChangeSeq = 0;
 
   // ── Preview state ──
   let previewInstanceId = $state("");
@@ -207,6 +247,67 @@
 
   // ── Rewind modal ──
   let rewindModalOpen = $state(false);
+  let codexReviewPickerOpen = $state(false);
+
+  // ── Codex Wave-3: turn-based rewind + goal modals ──
+  let codexRewindOpen = $state(false);
+  let codexRewindBusy = $state(false);
+  let goalPanelOpen = $state(false);
+
+  // Top-level user messages → selectable turns for the Codex rewind modal.
+  // Built lazily (only when the modal opens) rather than on every stream event:
+  // it's the only consumer, and the per-turn regex/slice work is O(turns). The
+  // cheap `store.userTurnCount` gates whether the entry point is shown/enabled.
+  let codexRewindTurns = $state<RewindTurn[]>([]);
+  function buildCodexRewindTurns(): RewindTurn[] {
+    const turns: RewindTurn[] = [];
+    let idx = 0;
+    for (const e of store.timeline) {
+      if (e.kind === "user") {
+        turns.push({ index: idx, preview: e.content.replace(/\s+/g, " ").trim().slice(0, 80) });
+        idx++;
+      }
+    }
+    return turns;
+  }
+  function openCodexRewind() {
+    codexRewindTurns = buildCodexRewindTurns();
+    codexRewindOpen = true;
+  }
+
+  async function runCodexRewind(opts: { dropFromTurnIndex: number; numTurns: number }) {
+    if (!store.run || effectiveAgent !== "codex") return;
+    codexRewindBusy = true;
+    try {
+      await api.rollbackTurns(store.run.id, opts.numTurns);
+      // Backend rolled back history; mirror it locally (files unchanged).
+      const dropped = store.truncateToTurn(opts.dropFromTurnIndex);
+      appendCommandOutput(t("codexRewind_done", { n: String(dropped) }));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      dbgWarn("chat", "codex rewind failed", err);
+      appendCommandOutput(t("codexRewind_failed", { error: msg }));
+    } finally {
+      codexRewindBusy = false;
+    }
+  }
+
+  // Build the review prompt for the picker choice and send it as a Codex turn.
+  function runCodexReview(choice: { kind: CodexReviewKind; value: string }) {
+    if (store.isRunning) {
+      appendCommandOutput(t("codexReview_busy"));
+      return;
+    }
+    const prompt =
+      choice.kind === "base"
+        ? codexReviewBasePrompt(choice.value)
+        : choice.kind === "commit"
+          ? codexReviewCommitPrompt(choice.value)
+          : choice.kind === "custom"
+            ? codexReviewCustomPrompt(choice.value)
+            : CODEX_REVIEW_UNCOMMITTED_PROMPT;
+    void sendMessage(prompt, []);
+  }
   let rewindDirectTarget = $state<RewindCandidate | null>(null);
   let rewindMarkers = $state<RewindMarker[]>([]);
 
@@ -377,6 +478,12 @@
   // ── MCP panel ──
   let mcpPanelOpen = $state(false);
 
+  // ── Codex features panel (experimentalFeature/list, live session only) ──
+  let featuresPanelOpen = $state(false);
+
+  // ── Codex turn diff (live aggregated diff for the current turn) ──
+  let turnDiffOpen = $state(false);
+
   // ── CLI session browser ──
 
   // Track status bar expansion for MCP panel offset
@@ -506,6 +613,25 @@
   let contextHistoryMap = $state<Map<string, ContextSnapshot[]>>(new Map());
   let contextHistory = $derived(contextHistoryMap.get(store.run?.id ?? "") ?? []);
 
+  // ── Per-run prompt drafts (issue #156) ──
+  // PromptInput unmounts/remounts on run switch (it's gated behind a phase condition, and loadRun
+  // flips phase to "running" mid-replay). So instead of stashing at transition time (unreliable —
+  // promptRef is mid-churn), PromptInput reports every draft change via onDraftChange, and we seed
+  // the freshly-mounted instance from this map via initialDraft (the `{#key}` forces a clean
+  // remount per run). Keyed by run id; "" = the not-yet-started "new chat".
+  let promptDraftsByRun = new Map<string, PromptInputSnapshot>();
+
+  function savePromptDraft(snap: PromptInputSnapshot) {
+    const rid = store.run?.id ?? "";
+    const hasContent =
+      snap.text.trim() ||
+      snap.attachments.length ||
+      snap.pastedBlocks.length ||
+      (snap.pathRefs?.length ?? 0) > 0;
+    if (hasContent) promptDraftsByRun.set(rid, snap);
+    else promptDraftsByRun.delete(rid);
+  }
+
   // ── Cumulative session token totals (from modelUsage, which is session-cumulative) ──
   // status bar shows session totals; per-turn values are in the turn separator annotations.
   let cumulativeTokens = $derived.by(() => {
@@ -532,6 +658,10 @@
     return { input, output, cacheRead, cacheWrite };
   });
 
+  // ── Agent-aware display helpers ──
+  let effectiveAgent = $derived(store.run?.agent ?? store.agent);
+  let agentDisplayName = $derived(effectiveAgent === "codex" ? "Codex" : "Claude");
+
   // ── Session info for InfoPanel ──
   let currentSessionInfo: SessionInfoData | null = $derived.by(() => {
     if (!store.run) return null;
@@ -546,9 +676,12 @@
       endedAt: store.run.ended_at ?? null,
       lastTurnDurationMs: store.durationMs,
       tokensEstimated: !store.usage.modelUsage || Object.keys(store.usage.modelUsage).length === 0,
-      model: store.run.model ?? store.model,
+      model:
+        effectiveAgent === "codex"
+          ? codexDisplayModel(store.run.model)
+          : (store.run.model ?? store.model),
       agent: store.run.agent ?? store.agent,
-      cliVersion: store.cliVersion,
+      cliVersion: effectiveAgent === "codex" ? (getCodexVersion() ?? "") : store.cliVersion,
       permissionMode: store.permissionMode,
       fastModeState: store.fastModeState,
       cost: store.usage.cost,
@@ -593,6 +726,21 @@
     return cliVersionInfo.channel === "stable" ? cliVersionInfo.stable : cliVersionInfo.latest;
   });
 
+  // ── Hero meta version (agent-correct) ──
+  // Codex → codex-cli version (strip the "codex-cli " prefix + leading "v" so chat_cliVersion's
+  // "v{version}" renders cleanly); Claude → its CLI version. The update-check is Claude-only.
+  let heroCliVersion = $derived(
+    effectiveAgent === "codex"
+      ? (getCodexVersion() ?? "").replace(/^codex-cli\s*/i, "").replace(/^v/i, "")
+      : (cliVersionInfo?.installed ?? ""),
+  );
+  let heroHasUpdate = $derived(
+    effectiveAgent !== "codex" &&
+      !!cliVersionInfo?.installed &&
+      !!channelLatest &&
+      cliVersionInfo.installed !== channelLatest,
+  );
+
   // ── Platform display name ──
   let platformDisplayName = $derived.by(() => {
     const pid = store.platformId;
@@ -618,13 +766,19 @@
     }));
   });
 
-  let effectiveModels = $derived(platformModels.length > 0 ? platformModels : getCliModels());
+  let effectiveModels = $derived(getModelsForAgent(effectiveAgent, { platformModels }));
   let currentEffort = $state("");
+  let isCodexAgent = $derived(store.agent === "codex");
+  let assistantDisplayName = $derived(isCodexAgent ? "Codex" : t("chat_claude"));
 
   // Effort guard: auto-clear effort when model doesn't support it;
   // also auto-populate default effort ("high") when empty and model supports it.
   $effect(() => {
-    if (store.agent !== "claude") return;
+    if (!store.features.effortSelector) return;
+
+    // Codex: effort is user-driven and persisted to agent settings (not CLI config).
+    // No auto-default — empty means "use Codex's own default" (spawn skips the flag).
+    if (effectiveAgent === "codex") return;
 
     const pid = store.platformId;
     // Third-party platform: don't touch effort
@@ -899,6 +1053,51 @@
     return preloadedSkills.map((s) => ({ name: s.name, description: s.description }));
   });
 
+  /** Race guard for the runtime skills query (run can switch mid-flight). */
+  let codexSkillsGen = 0;
+  /** Source the live Codex agent's loaded skills via app-server `skills/list`. Gated to a live
+   *  Codex session — no session means no process to ask, so we clear and the picker stays hidden
+   *  (avoids offering skills we can't send). Runs once per (runId, sessionAlive) transition. */
+  $effect(() => {
+    const runId = store.run?.id;
+    const live = effectiveAgent === "codex" && store.sessionAlive && !!runId;
+    if (!live) {
+      if (codexRuntimeSkills.length > 0) codexRuntimeSkills = [];
+      return;
+    }
+    const gen = ++codexSkillsGen;
+    dbg("skills", "fetch runtime skills", { runId });
+    api
+      .listCodexSkillsRuntime(runId!)
+      .then((res) => {
+        if (gen !== codexSkillsGen) return; // run/session changed while in flight
+        // Flatten every cwd entry's enabled skills; only enabled ones can actually trigger.
+        const flat = res.data.flatMap((entry) =>
+          entry.skills
+            .filter((s) => s.enabled)
+            .map((s) => ({
+              name: s.name,
+              path: s.path,
+              description: s.shortDescription ?? s.description ?? "",
+            })),
+        );
+        codexRuntimeSkills = flat;
+        dbg("skills", "runtime skills loaded", { count: flat.length });
+      })
+      .catch((e) => dbgWarn("skills", "listCodexSkillsRuntime failed", e));
+  });
+
+  /** Upgrade the Codex model catalog from the live app-server session (control `model_list`),
+   *  which is authoritative for the running CLI. Falls back to the pre-session catalog
+   *  (loadCodexModels) when no live session. Runs once per (runId, sessionAlive) transition. */
+  $effect(() => {
+    const runId = store.run?.id;
+    const live = effectiveAgent === "codex" && store.sessionAlive && !!runId;
+    if (!live) return;
+    dbg("models", "live session up, refreshing codex catalog", { runId });
+    void loadCodexModelsLive(runId!);
+  });
+
   // ── Per-turn usage annotations in timeline ──
 
   let usageByTurn = $derived(new Map(store.turnUsages.map((tu) => [tu.turnIndex, tu])));
@@ -1081,6 +1280,22 @@
   let hasResumeParam = $derived($page.url.searchParams.has("resume"));
   let folderParam = $derived($page.url.searchParams.get("folder"));
   let hostParam = $derived($page.url.searchParams.get("host"));
+  let agentParam = $derived($page.url.searchParams.get("agent"));
+
+  // Consume ?agent= param: switch agent for new sessions, then clean URL
+  $effect(() => {
+    const a = agentParam;
+    if (!a) return;
+    untrack(() => {
+      const clean = new URL($page.url);
+      clean.searchParams.delete("agent");
+      replaceState(clean, {});
+      // ?agent= only applies to new sessions — ignore when loading an existing run
+      if (!runId && isKnownAgent(a)) {
+        handleAgentChange(a, true); // force=true to run full side effects
+      }
+    });
+  });
 
   // Consume ?folder= and/or ?host= params: switch target/folder, then clean URL.
   $effect(() => {
@@ -1144,6 +1359,11 @@
     try {
       settings = await api.getUserSettings();
       store.authMode = settings.auth_mode ?? "cli";
+      // Fresh session: honor the user's default agent (composer pre-selects it). Existing
+      // runs are unaffected — loadRun sets store.agent from the run's own agent.
+      if (!runId && !store.run) {
+        store.agent = settings.default_agent === "codex" ? "codex" : "claude";
+      }
       remoteHosts = settings.remote_hosts ?? [];
       // Restore last target selection (must validate against current settings — a
       // configured host may have been removed since the value was persisted).
@@ -1161,7 +1381,7 @@
       }
       // Initialize model: for third-party platforms, use credential > preset default model
       // Only for new sessions — if runId is set, loadRun will handle model restoration.
-      if (!store.model && !runId && store.phase !== "loading") {
+      if (!store.model && !runId && store.phase !== "loading" && store.useStreamSession) {
         const initCred = findCredential(
           settings.platform_credentials ?? [],
           store.platformId ?? "",
@@ -1186,37 +1406,42 @@
     } catch (e) {
       dbgWarn("chat", "failed to load settings:", e);
     }
-    try {
-      agentSettings = await api.getAgentSettings("claude");
-      // Read effort from CLI config (~/.claude/settings.json) — the authoritative source.
-      // NOT from agentSettings.effort (that would cause --effort flag at spawn, which
-      // locks effort in memory and prevents live switching via settings.json).
+    // When a valid ?agent= param exists, handleAgentChange(force) will handle
+    // agentSettings + effort loading. Skip here to avoid concurrent overwrites.
+    const hasValidAgentParam = agentParam && isKnownAgent(agentParam);
+    if (!hasValidAgentParam) {
       try {
-        const cliCfg = await api.getCliConfig();
-        const cliEffort = cliCfg.effortLevel;
-        currentEffort = typeof cliEffort === "string" && cliEffort ? cliEffort : "";
-      } catch {
-        currentEffort = "";
+        agentSettings = await api.getAgentSettings(store.agent);
+        if (store.agent === "codex") {
+          // Codex: agent settings ARE the source of truth (injected as
+          // -c model_reasoning_effort at spawn). Do NOT run the Claude migration below.
+          // Default to "medium" (Codex's own default reasoning effort) when unset so the
+          // effort selector always shows a highlighted value.
+          currentEffort = agentSettings?.effort || "medium";
+        } else {
+          // Claude: read effort from CLI config (~/.claude/settings.json) — the authoritative
+          // source. NOT from agentSettings.effort (that would cause --effort flag at spawn,
+          // which locks effort in memory and prevents live switching via settings.json).
+          try {
+            const cliCfg = await api.getCliConfig();
+            const cliEffort = cliCfg.effortLevel;
+            currentEffort = typeof cliEffort === "string" && cliEffort ? cliEffort : "";
+          } catch {
+            currentEffort = "";
+          }
+          // One-time migration: clear stale agentSettings.effort to prevent --effort at spawn
+          if (agentSettings?.effort) {
+            api.updateAgentSettings(store.agent, { effort: "" }).catch(() => {});
+          }
+        }
+      } catch (e) {
+        dbgWarn("chat", "failed to load agent settings:", e);
       }
-      // One-time migration: clear stale agentSettings.effort to prevent --effort at spawn
-      if (agentSettings?.effort) {
-        api.updateAgentSettings("claude", { effort: "" }).catch(() => {});
-      }
-    } catch (e) {
-      dbgWarn("chat", "failed to load agent settings:", e);
     }
-    // Initialize permission mode from saved settings (before session_init arrives)
-    // Agent plan_mode=true overrides user permission_mode (legacy compat)
-    if (!store.permissionModeSetByUser) {
-      if (agentSettings?.plan_mode) {
-        store.permissionMode = "plan";
-        store.permissionModeSetByUser = true;
-      } else if (settings?.permission_mode) {
-        const cliName = APP_TO_CLI_MODE[settings.permission_mode] ?? settings.permission_mode;
-        store.permissionMode = cliName;
-        store.permissionModeSetByUser = true;
-      }
-    }
+    // Initialize permission mode from saved settings (before session_init arrives).
+    // Uses syncPermissionModeFromSettings helper — does NOT set permissionModeSetByUser.
+    // That flag is only set by handlePermissionModeChange() (user manual action).
+    syncPermissionModeFromSettings(agentSettings, settings);
     // Find most recent run with session_id for "Continue last session"
     try {
       const runs = await api.listRuns();
@@ -1231,6 +1456,8 @@
     }
     let selfHealDone = false;
     let selfHealInFlight = false;
+    // Codex model catalog (live from app-server). Fire-and-forget; 5min TTL cache.
+    void loadCodexModels();
     loadCliInfo().then(() => {
       // Self-heal: detect and fix contaminated default_model
       if (settings?.default_model && !selfHealDone && !selfHealInFlight) {
@@ -1273,7 +1500,14 @@
         lastKnownGoodAnthropicModel = cliModel;
       }
       // Only for genuinely new chats: no run loaded/loading, no URL run param
-      if (cliModel && !store.run && !runId && store.phase !== "loading" && !isThirdParty) {
+      if (
+        cliModel &&
+        !store.run &&
+        !runId &&
+        store.phase !== "loading" &&
+        !isThirdParty &&
+        store.useStreamSession
+      ) {
         dbg("chat", "set model from CLI after loadCliInfo", { cliModel, prev: store.model });
         store.model = cliModel;
       }
@@ -1369,7 +1603,6 @@
       onRunEvent(event) {
         if (
           store.run?.execution_path === "pipe_exec" &&
-          store.run &&
           event.run_id === store.run.id &&
           xtermRef
         ) {
@@ -1768,7 +2001,7 @@
   // For Anthropic, prefer CC's current active model, fall back to our saved default_model
   // (only if confirmed clean via three-state contamination check).
   $effect(() => {
-    if (!store.model) {
+    if (!store.model && store.useStreamSession) {
       // Don't overwrite model during loadRun async gap — loadRun will set it
       if (store.phase === "loading") return;
 
@@ -1897,8 +2130,18 @@
 
   // ── Send message ──
 
-  async function sendMessage(text: string, attachments: Attachment[]) {
+  async function sendMessage(
+    text: string,
+    attachments: Attachment[],
+    // Codex skill refs picked in the composer (live-Codex only). Forwarded to store.sendMessage,
+    // which threads them to the structured {type:"skill"} send. Empty for Claude / no-skill sends.
+    skills?: { name: string; path: string }[],
+  ) {
     if (!text.trim()) return;
+
+    // The draft is being sent — drop it so it can't resurface. Esp. the "" new-chat bucket: its
+    // PromptInput remounts under the new run id before the clear effect flushes, so rely on this.
+    promptDraftsByRun.delete(store.run?.id ?? "");
 
     store.error = "";
     // Follow to new reply when sending a message
@@ -2013,7 +2256,12 @@
           processingSlashCmd = slashCmd;
           slashCmdSeenRunning = false;
         }
-        await store.sendMessage(text, attachments);
+        // A stopped Codex app-server session re-spawns inside sendMessage; refresh the
+        // sidebar afterward so its status badge leaves the stale "stopped" state.
+        const wasStoppedCodex =
+          store.useStreamSession && !store.sessionAlive && store.run?.agent === "codex";
+        await store.sendMessage(text, attachments, skills);
+        if (wasStoppedCodex) window.dispatchEvent(new Event("ocv:runs-changed"));
         requestAnimationFrame(() => promptRef?.focus());
       }
     } catch (e) {
@@ -2027,8 +2275,15 @@
   }
 
   // ── Project init detection ──
+  // For Claude session: check CLAUDE.md; for Codex: check AGENTS.md.
+  // Hint only fires before a session starts (when `!store.run`), so `effectiveAgent`
+  // reflects the user's selected agent from settings.
   let showInitHint = $derived(
-    projectInitStatus !== null && !projectInitStatus.has_claude_md && !store.run,
+    projectInitStatus !== null &&
+      !store.run &&
+      (effectiveAgent === "codex"
+        ? !projectInitStatus.has_agents_md
+        : !projectInitStatus.has_claude_md),
   );
 
   /** Reload project-level data (skills, agents, commands) with race guard. */
@@ -2108,6 +2363,98 @@
     dbg("chat", "init hint dismissed");
   }
 
+  // ── Agent switching ──
+
+  /**
+   * Sync permission mode from agent/user settings.
+   * Only syncs when the user hasn't manually changed the mode this session.
+   * Does NOT set permissionModeSetByUser — that flag is only set by
+   * handlePermissionModeChange() (user manual action).
+   */
+  function syncPermissionModeFromSettings(as: AgentSettings | null, us: UserSettings | null) {
+    if (store.permissionModeSetByUser) return;
+    // Priority: agent.permission_mode > agent.plan_mode > user.permission_mode
+    if (as?.permission_mode) {
+      const cliName = APP_TO_CLI_MODE[as.permission_mode] ?? as.permission_mode;
+      store.permissionMode = cliName;
+    } else if (as?.plan_mode) {
+      store.permissionMode = "plan";
+    } else if (us?.permission_mode) {
+      const cliName = APP_TO_CLI_MODE[us.permission_mode] ?? us.permission_mode;
+      store.permissionMode = cliName;
+    }
+  }
+
+  async function handleAgentChange(newAgent: string, force = false) {
+    if (!force && newAgent === store.agent) return;
+    const seq = ++agentChangeSeq;
+    store.agent = newAgent;
+
+    // Model: clear and let the $effect(:1546) safely restore for Claude.
+    // For Codex, the $effect is gated by useStreamSession → stays empty → spawn.rs skips --model.
+    store.model = "";
+
+    // Async: agentSettings
+    try {
+      const as = await api.getAgentSettings(newAgent);
+      if (seq !== agentChangeSeq) return; // stale
+      agentSettings = as;
+    } catch {
+      if (seq !== agentChangeSeq) return;
+      agentSettings = null;
+    }
+
+    // Async: effort
+    if (newAgent === "codex") {
+      // Codex: effort lives in agent settings (injected at spawn), not CLI config.
+      // Default to "medium" (Codex's default) when unset so the selector shows a value.
+      currentEffort = agentSettings?.effort || "medium";
+    } else if (store.features.effortSelector) {
+      try {
+        const cfg = await api.getCliConfig();
+        if (seq !== agentChangeSeq) return;
+        currentEffort = typeof cfg.effortLevel === "string" ? cfg.effortLevel : "";
+      } catch {
+        if (seq !== agentChangeSeq) return;
+        currentEffort = "";
+      }
+    } else {
+      currentEffort = "";
+    }
+
+    if (seq !== agentChangeSeq) return;
+    // One-time migration: clear stale agentSettings.effort
+    if (agentSettings?.effort) {
+      api.updateAgentSettings(newAgent, { effort: "" }).catch(() => {});
+    }
+
+    // Re-sync permissionMode — reset flag (new agent needs fresh sync), then sync
+    store.permissionModeSetByUser = false;
+    syncPermissionModeFromSettings(agentSettings, settings);
+
+    // Auth detection banner (Codex only)
+    if (newAgent === "codex") {
+      codexWarning = null;
+      api
+        .checkCodexAuth()
+        .then((status) => {
+          if (seq !== agentChangeSeq) return;
+          if (!status.installed) {
+            codexWarning = t("codex_notInstalled");
+          } else if (!status.logged_in) {
+            codexWarning = t("codex_notLoggedIn");
+          } else {
+            codexWarning = null;
+          }
+        })
+        .catch(() => {});
+    } else {
+      codexWarning = null;
+    }
+
+    dbg("chat", "agent changed", { agent: newAgent, seq });
+  }
+
   // ── Permission mode name translation ──
   // Store/dropdown use CLI names; UserSettings uses app names; adapter.rs maps app→CLI.
   const CLI_TO_APP_MODE: Record<string, string> = {
@@ -2158,8 +2505,53 @@
     store.permissionModeSetByUser = true;
     store.permissionModePersistFailed = false;
 
+    const appName = CLI_TO_APP_MODE[newMode] ?? newMode;
+
+    if (effectiveAgent === "codex") {
+      // Codex (app-server): persist to agent-scoped settings (future spawns) AND, when the
+      // session is alive, hot-switch via the control protocol so the override applies on the
+      // NEXT turn. The backend maps `newMode` (CLI mode, e.g. acceptEdits/plan/bypassPermissions)
+      // → approvalPolicy + sandboxPolicy, reusing the same semantics as the spawn-time path.
+      try {
+        await api.updateAgentSettings("codex", { permission_mode: appName });
+        dbg("chat", "codex permission_mode persisted", { appName });
+      } catch (e) {
+        if (seq !== permissionModeChangeSeq) return false;
+        // Rollback
+        store.permissionMode = oldMode;
+        store.permissionModeSetByUser = oldFlag;
+        store.permissionModePersistFailed = oldPersistFailed;
+        dbgWarn("chat", "codex permission_mode persist failed:", e);
+        store.error = t("chat_permModeFailed", { mode: newMode, error: String(e) });
+        if (opts?.toast !== false) showChatToast(t("toast_permissionChangeFailed"));
+        return false;
+      }
+      if (seq !== permissionModeChangeSeq) return false;
+      // Live apply to the running app-server session (best-effort; persisted value above
+      // is the fallback for future spawns if this fails or there is no live session).
+      let liveApplied = false;
+      if (hadActiveSession && store.run) {
+        try {
+          await api.setPermissionMode(store.run.id, newMode);
+          liveApplied = true;
+          dbg("chat", "codex permission mode hot-switched via control protocol", { newMode });
+        } catch (e) {
+          dbgWarn("chat", "codex permission mode hot-switch failed (persisted for next spawn):", e);
+        }
+      }
+      if (seq !== permissionModeChangeSeq) return false;
+      if (opts?.toast !== false) {
+        showChatToast(
+          liveApplied
+            ? t("toast_permissionMode", { mode: getPermModeLabel(newMode) })
+            : t("toast_permissionModeNextTurn", { mode: getPermModeLabel(newMode) }),
+        );
+      }
+      return true;
+    }
+
+    // Claude path: hot-switch via control protocol if active session
     if (hadActiveSession && store.run) {
-      // Active session: hot-switch via control protocol (CLI expects CLI names)
       try {
         await api.setPermissionMode(store.run.id, newMode);
         dbg("chat", "permission mode changed via control protocol", { newMode });
@@ -2187,7 +2579,6 @@
     // Persist — serialized to prevent concurrent writes overwriting each other.
     // persistFailed flag signals whether the no-active-session branch reverted.
     let persistFailed = false;
-    const appName = CLI_TO_APP_MODE[newMode] ?? newMode;
 
     pendingPersist = pendingPersist
       .then(async () => {
@@ -2224,7 +2615,7 @@
 
     // Sync legacy plan_mode (fire-and-forget)
     if (seq === permissionModeChangeSeq) {
-      api.updateAgentSettings("claude", { plan_mode: newMode === "plan" }).catch((e) => {
+      api.updateAgentSettings(store.agent, { plan_mode: newMode === "plan" }).catch((e) => {
         dbgWarn("chat", "plan_mode sync failed:", e);
       });
     }
@@ -2303,10 +2694,45 @@
   }
 
   async function handleModelChange(newModel: string) {
-    dbg("chat", "model change", { from: store.model, to: newModel });
+    dbg("chat", "model change", { agent: effectiveAgent, from: store.model, to: newModel });
     store.model = newModel;
 
+    // Thunk — deferred execution, called explicitly per branch
+    const persistRunModel = () =>
+      store.run ? api.updateRunModel(store.run.id, newModel) : Promise.resolve();
+
+    if (effectiveAgent === "codex") {
+      // Codex (app-server): persist to agent settings + run meta (future spawns) AND, when the
+      // session is alive, hot-switch via the control protocol so the override applies on the
+      // NEXT turn. No Codex default_model concept — agent settings carry the per-agent model.
+      const [settingsResult, runResult] = await Promise.allSettled([
+        api.updateAgentSettings("codex", { model: newModel }),
+        persistRunModel(),
+      ]);
+      if (settingsResult.status === "rejected") {
+        dbgWarn("chat", "failed to persist codex agent settings", settingsResult.reason);
+      }
+      if (runResult.status === "rejected") {
+        dbgWarn("chat", "failed to persist codex run model", runResult.reason);
+      }
+      if (store.sessionAlive && store.run) {
+        try {
+          await api.setSessionModel(store.run.id, newModel);
+          dbg("chat", "codex model hot-switched via control protocol", { newModel });
+        } catch (e) {
+          dbgWarn("chat", "codex model hot-switch failed (persisted for next turn):", e);
+        }
+      }
+      return;
+    }
+
+    // Claude path:
     const isThirdParty = store.platformId && store.platformId !== "anthropic";
+
+    // Persist model to run meta (fire-and-forget)
+    persistRunModel().catch((e) => {
+      dbgWarn("chat", "failed to persist run model", e);
+    });
 
     // Hot-switch model if session is alive (only for Anthropic — third-party models
     // are set via ANTHROPIC_MODEL env var at spawn time, not via control protocol)
@@ -2317,13 +2743,6 @@
       } catch (e) {
         dbgWarn("chat", "model hot-switch failed, will use new model on next session", e);
       }
-    }
-
-    // Persist model to run meta (per-run model memory)
-    if (store.run) {
-      api.updateRunModel(store.run.id, newModel).catch((e) => {
-        dbgWarn("chat", "failed to persist run model", e);
-      });
     }
 
     // Only persist default_model for Anthropic — third-party models managed per-credential
@@ -2338,9 +2757,30 @@
   }
 
   async function handleEffortChange(newEffort: string) {
-    dbg("chat", "effort change", { from: currentEffort, to: newEffort });
+    dbg("chat", "effort change", { agent: effectiveAgent, from: currentEffort, to: newEffort });
     currentEffort = newEffort;
-    // Write to CLI config (~/.claude/settings.json) — the CLI reads effortLevel
+
+    if (effectiveAgent === "codex") {
+      // Codex (app-server): persist to agent settings (future spawns inject
+      // -c model_reasoning_effort) AND, when the session is alive, hot-switch via the control
+      // protocol so the override applies on the NEXT turn. Empty clears the override (Codex
+      // falls back to its own configured default).
+      if (agentSettings) agentSettings.effort = newEffort;
+      api.updateAgentSettings("codex", { effort: newEffort }).catch((e) => {
+        dbgWarn("chat", "failed to persist codex effort", e);
+      });
+      if (store.sessionAlive && store.run) {
+        try {
+          await api.setEffort(store.run.id, newEffort);
+          dbg("chat", "codex effort hot-switched via control protocol", { newEffort });
+        } catch (e) {
+          dbgWarn("chat", "codex effort hot-switch failed (persisted for next turn):", e);
+        }
+      }
+      return;
+    }
+
+    // Claude: write to CLI config (~/.claude/settings.json) — the CLI reads effortLevel
     // per-request, so changes take effect immediately within a running session.
     // Deliberately NOT writing to agentSettings.effort — that would cause --effort
     // to be passed at spawn, which locks the CLI's in-memory effort and prevents
@@ -2387,25 +2827,28 @@
     dbg("chat", "platform change", { from: store.platformId, to: platformId });
     store.platformId = platformId;
 
-    // Auto-switch model to provider's default when switching to a third-party platform
+    // Auto-switch model to provider's default when switching to a third-party platform.
+    // Only for stream-session agents — Codex manages its own model via CLI.
     // Priority: credential.models (user-configured) > preset.models (static defaults)
-    const cred = findCredential(settings?.platform_credentials ?? [], platformId);
-    const preset = PLATFORM_PRESETS.find((p) => p.id === platformId);
-    const models = cred?.models?.length ? cred.models : preset?.models;
-    if (models?.length) {
-      const defaultModel = models[0];
-      dbg("chat", "auto-switch model for platform", { platformId, model: defaultModel });
-      store.model = defaultModel;
-    } else if (platformId === "anthropic") {
-      // Switching back to Anthropic: always overwrite — don't keep third-party model;
-      // don't fallback to settings.default_model which might be contaminated.
-      const cliModel = getCliCurrentModel();
-      store.model = cliModel || "";
-      dbg("chat", "restore model on switch to anthropic", { cliModel, using: store.model });
-    } else {
-      // Custom/unknown platform without preset models: clear model
-      // (let CLI use whatever default it has, or the user can set manually)
-      store.model = "";
+    if (store.useStreamSession) {
+      const cred = findCredential(settings?.platform_credentials ?? [], platformId);
+      const preset = PLATFORM_PRESETS.find((p) => p.id === platformId);
+      const models = cred?.models?.length ? cred.models : preset?.models;
+      if (models?.length) {
+        const defaultModel = models[0];
+        dbg("chat", "auto-switch model for platform", { platformId, model: defaultModel });
+        store.model = defaultModel;
+      } else if (platformId === "anthropic") {
+        // Switching back to Anthropic: always overwrite — don't keep third-party model;
+        // don't fallback to settings.default_model which might be contaminated.
+        const cliModel = getCliCurrentModel();
+        store.model = cliModel || "";
+        dbg("chat", "restore model on switch to anthropic", { cliModel, using: store.model });
+      } else {
+        // Custom/unknown platform without preset models: clear model
+        // (let CLI use whatever default it has, or the user can set manually)
+        store.model = "";
+      }
     }
 
     // Only persist default_model when switching to Anthropic with a validated CLI model.
@@ -2593,6 +3036,24 @@
 
   async function handleVirtualCommand(action: string, args: string) {
     dbg("chat", "virtualCommand", { action, args });
+    // Guard: block excluded virtual commands for the current agent.
+    // Emits user-visible feedback so gated commands don't fail silently when
+    // typed directly (the menu already hides them, but direct invocation,
+    // history replay, and tests can still reach here).
+    const vDef = VIRTUAL_COMMANDS.find((v) => v["_action"] === action);
+    if (vDef) {
+      const excluded = vDef["_excludeAgents"];
+      if (Array.isArray(excluded) && excluded.includes(effectiveAgent)) {
+        dbg("chat", "virtualCommand blocked for agent", { action, agent: effectiveAgent });
+        appendCommandOutput(
+          t("slash_notSupportedForAgent", {
+            command: vDef.name,
+            agent: effectiveAgent === "codex" ? "Codex" : "Claude",
+          }),
+        );
+        return;
+      }
+    }
     if (action === "copy-last") {
       const lastAssistant = [...store.timeline].reverse().find((e) => e.kind === "assistant");
       if (lastAssistant && lastAssistant.kind === "assistant" && lastAssistant.content) {
@@ -2639,12 +3100,14 @@
       }
       // On failure, handlePermissionModeChange already sets store.error
     } else if (action === "show-help") {
-      const allCmds = mergeWithVirtual(
+      const baseCmds =
         store.sessionInitReceived && store.sessionCommands.length > 0
           ? store.sessionCommands
-          : mergeProjectCommands(getCliCommands(), projectCommands),
-      );
-      const skillSet = new Set(store.availableSkills);
+          : effectiveAgent === "codex"
+            ? []
+            : mergeProjectCommands(getCliCommands(), projectCommands);
+      const allCmds = mergeWithVirtual(baseCmds, effectiveAgent);
+      const skillSet = effectiveAgent === "codex" ? undefined : new Set(store.availableSkills);
       appendCommandOutput(buildHelpText(allCmds, skillSet));
     } else if (action === "run-doctor") {
       try {
@@ -2670,41 +3133,20 @@
       // Escape markdown special chars in todo content
       const esc = (s: string) => s.replace(/([\\*_~`[\]#>|])/g, "\\$1");
 
-      // Find the last TodoWrite tool_end in timeline with newTodos
-      const lastTodo = [...store.timeline]
-        .reverse()
-        .find(
-          (e): e is Extract<TimelineEntry, { kind: "tool" }> =>
-            e.kind === "tool" &&
-            e.tool.tool_name === "TodoWrite" &&
-            e.tool.status === "success" &&
-            e.tool.tool_use_result != null &&
-            typeof e.tool.tool_use_result === "object" &&
-            "newTodos" in e.tool.tool_use_result &&
-            Array.isArray(e.tool.tool_use_result.newTodos),
-        );
-
-      if (lastTodo) {
-        const todos = lastTodo.tool.tool_use_result!.newTodos as Array<{
-          content: string;
-          status: "pending" | "in_progress" | "completed";
-        }>;
-        if (todos.length === 0) {
-          appendCommandOutput(t("todos_empty"));
-        } else {
-          const lines = todos.map((td) => {
-            const text = esc(td.content);
-            if (td.status === "completed") return `- [x] ~~${text}~~`;
-            if (td.status === "in_progress") return `- [ ] **⏳ ${text}**`;
-            return `- [ ] ${text}`;
-          });
-          appendCommandOutput(lines.join("\n"));
-        }
-      } else {
-        // No TodoWrite in timeline — show local prompt
-        // CLI /todos is an internal command that doesn't produce timeline events,
-        // so fallback to sendMessage would just create an empty turn.
+      // Same source as the TodoPanel (Tasks system or legacy TodoWrite). Empty covers
+      // both "no tasks yet" and an empty list — CLI /todos produces no timeline event,
+      // so there's nothing to send.
+      const tasks = store.panelTasks;
+      if (tasks.length === 0) {
         appendCommandOutput(t("todos_empty"));
+      } else {
+        const lines = tasks.map((task) => {
+          const text = esc(task.text);
+          if (task.status === "completed") return `- [x] ~~${text}~~`;
+          if (task.status === "in_progress") return `- [ ] **⏳ ${text}**`;
+          return `- [ ] ${text}`;
+        });
+        appendCommandOutput(lines.join("\n"));
       }
     } else if (action === "show-diff") {
       const cwd = store.effectiveCwd || localStorage.getItem("ocv:project-cwd") || "";
@@ -2917,28 +3359,32 @@
         );
       }
     } else if (action === "clear-context") {
-      if (!store.run || !store.sessionAlive) {
+      if (!store.run) {
         appendCommandOutput(t("chat_noActiveSession"));
-        return;
-      }
-      if (!store.useStreamSession) {
-        appendCommandOutput(t("chat_clearNotSupported"));
         return;
       }
       if (store.isRunning) {
         appendCommandOutput(t("chat_clearSessionBusy"));
         return;
       }
-      dbg("chat", "clear-context: stopping session", { runId: store.run.id });
-      try {
-        await store.stop();
-        dbg("chat", "clear-context: navigating to fresh chat");
-        goto("/chat", { replaceState: true });
-        window.dispatchEvent(new Event("ocv:runs-changed"));
-      } catch (e) {
-        dbgWarn("chat", "clear-context failed", e);
-        store.error = String(e);
+
+      if (store.useStreamSession) {
+        // Claude: stop active session actor
+        dbg("chat", "clear-context: stopping Claude session", { runId: store.run.id });
+        try {
+          await store.stop();
+        } catch (e) {
+          dbgWarn("chat", "clear-context stop failed", e);
+          store.error = String(e);
+          return;
+        }
+      } else {
+        // Codex: current run retains its thread. Navigate to fresh chat → new thread on next msg.
+        dbg("chat", "clear-context: leaving Codex run", { runId: store.run.id });
       }
+
+      goto("/chat", { replaceState: true });
+      window.dispatchEvent(new Event("ocv:runs-changed"));
     } else if (action === "rewind") {
       if (!store.run) {
         appendCommandOutput(t("rewind_noSession"));
@@ -2962,7 +3408,26 @@
         window.open(url, "_blank");
       }
       appendCommandOutput("Opening sticker page in browser…");
+    } else if (action === "open-feedback") {
+      // Source-of-truth: matches package.json `bugs.url`. If the repo URL ever
+      // changes, update both this constant AND package.json.
+      const url = "https://github.com/AnyiWang/OpenCovibe/issues";
+      dbg("chat", "open-feedback", { url });
+      try {
+        const { open } = await import("@tauri-apps/plugin-shell");
+        await open(url);
+      } catch (err) {
+        dbgWarn("chat", "open-feedback: plugin-shell failed, fallback", err);
+        window.open(url, "_blank");
+      }
+      appendCommandOutput(t("feedback_opening"));
     } else if (action === "start-ralph-loop") {
+      // Defense-in-depth: even if menu/parse layers miss it, Ralph requires
+      // a long-lived stream-session — Codex pipe-exec is incompatible.
+      if (effectiveAgent === "codex") {
+        appendCommandOutput("Ralph loop is not supported for Codex sessions yet.");
+        return;
+      }
       const parsed = parseRalphArgs(args);
       if (!parsed.prompt) {
         appendCommandOutput(
@@ -3000,6 +3465,10 @@
         );
       }
     } else if (action === "cancel-ralph-loop") {
+      if (effectiveAgent === "codex") {
+        appendCommandOutput("Ralph loop is not supported for Codex sessions yet.");
+        return;
+      }
       await handleRalphCancel();
     } else if (action === "toggle-preview") {
       if (args) {
@@ -3015,6 +3484,186 @@
           appendCommandOutput(t("preview_usage"));
         }
       }
+    } else if (action === "init-project") {
+      // Codex-only: mirror Codex TUI's /init by injecting the upstream init
+      // prompt as a user message. The model runs git ls-files and writes
+      // AGENTS.md via its file tools. Claude CLI handles /init itself.
+      //
+      // Order: agent → cwd resolve → no-cwd → remote → isRunning → pathExists
+      // → dbg(requested) → localStorage handoff → sendMessage. Each guard
+      // emits a dbgWarn so blocked requests are traceable; the "requested"
+      // dbg only fires once all guards pass.
+      if (effectiveAgent !== "codex") return;
+      const projectCwd =
+        store.effectiveCwd ||
+        store.sessionCwd ||
+        store.run?.cwd ||
+        folderCwdOverride ||
+        projectInitStatus?.cwd ||
+        (typeof localStorage !== "undefined"
+          ? (localStorage.getItem("ocv:project-cwd") ?? "")
+          : "");
+      if (!projectCwd) {
+        dbgWarn("chat", "init-project blocked: no cwd");
+        appendCommandOutput(t("init_noCwd"));
+        return;
+      }
+      // Remote target: sendMessage resolves cwd via getStoredRemoteCwd(host)
+      // (chat/+page.svelte:1968), not localStorage. The handoff below cannot
+      // bridge those paths. Guard remote until wave 4b unifies cwd resolution.
+      if (store.remoteHostName) {
+        dbgWarn("chat", "init-project blocked: remote not supported", {
+          host: store.remoteHostName,
+        });
+        appendCommandOutput(t("init_remoteNotSupported"));
+        return;
+      }
+      if (store.isRunning) {
+        dbgWarn("chat", "init-project blocked: turn running");
+        appendCommandOutput(t("init_busy"));
+        return;
+      }
+      try {
+        const exists = await api.agentsMdExists(projectCwd);
+        if (exists) {
+          dbgWarn("chat", "init-project blocked: AGENTS.md exists");
+          appendCommandOutput(t("init_alreadyExists"));
+          return;
+        }
+      } catch (err) {
+        dbgWarn("chat", "init: agentsMdExists failed", err);
+        appendCommandOutput(
+          `Failed to check AGENTS.md: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return;
+      }
+      dbg("chat", "init-project requested", { cwd: projectCwd });
+      // Persist cwd so sendMessage's new-run path (+page.svelte:1976 reads
+      // localStorage only) starts the init run in the same directory the
+      // guard validated. Without this, a guard pass via projectInitStatus?.cwd
+      // or folderCwdOverride could disagree with sendMessage's resolution.
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem("ocv:project-cwd", projectCwd);
+        window.dispatchEvent(new Event("ocv:cwd-changed"));
+      }
+      await sendMessage(CODEX_INIT_PROMPT, []);
+    } else if (action === "codex-agent-info") {
+      // Codex TUI's /agent opens a sub-agent picker (OpenAgentPicker). We
+      // don't have that UI yet; sub-agents nest inline as Agent tool calls.
+      // This handler just explains.
+      if (effectiveAgent !== "codex") return;
+      dbg("chat", "codex-agent-info");
+      appendCommandOutput(t("codexAgent_notSupported"));
+    } else if (action === "codex-review") {
+      // Codex /review v1: inject the "review uncommitted changes" prompt and
+      // let the model gather git diff + analyze. Same guard order as
+      // init-project. Picker for the other 3 review presets is wave 4b.
+      if (effectiveAgent !== "codex") return;
+      const projectCwd =
+        store.effectiveCwd ||
+        store.sessionCwd ||
+        store.run?.cwd ||
+        folderCwdOverride ||
+        projectInitStatus?.cwd ||
+        (typeof localStorage !== "undefined"
+          ? (localStorage.getItem("ocv:project-cwd") ?? "")
+          : "");
+      if (!projectCwd) {
+        dbgWarn("chat", "codex-review blocked: no cwd");
+        appendCommandOutput(t("codexReview_noCwd"));
+        return;
+      }
+      if (store.remoteHostName) {
+        dbgWarn("chat", "codex-review blocked: remote not supported", {
+          host: store.remoteHostName,
+        });
+        appendCommandOutput(t("codexReview_remoteNotSupported"));
+        return;
+      }
+      if (store.isRunning) {
+        dbgWarn("chat", "codex-review blocked: turn running");
+        appendCommandOutput(t("codexReview_busy"));
+        return;
+      }
+      dbg("chat", "codex-review requested", { cwd: projectCwd });
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem("ocv:project-cwd", projectCwd);
+        window.dispatchEvent(new Event("ocv:cwd-changed"));
+      }
+      // Open the preset picker (uncommitted / base / commit / custom).
+      codexReviewPickerOpen = true;
+    } else if (action === "codex-login") {
+      if (effectiveAgent !== "codex") return; // defensive (generic gate already blocks)
+      if (store.isRunning) {
+        appendCommandOutput(t("codexLogin_busy"));
+        return;
+      }
+      appendCommandOutput(t("codexLogin_opening"));
+      try {
+        await api.runCodexLogin();
+        appendCommandOutput(t("codexLogin_success"));
+        // Settings page may be open — let it refresh its auth status.
+        window.dispatchEvent(new Event("ocv:codex-auth-changed"));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        dbgWarn("chat", "codex login failed", err);
+        appendCommandOutput(t("codexLogin_failed", { error: msg }));
+      }
+    } else if (action === "codex-logout") {
+      if (effectiveAgent !== "codex") return;
+      if (store.isRunning) {
+        appendCommandOutput(t("codexLogin_busy"));
+        return;
+      }
+      try {
+        await api.runCodexLogout();
+        appendCommandOutput(t("codexLogout_success"));
+        window.dispatchEvent(new Event("ocv:codex-auth-changed"));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        dbgWarn("chat", "codex logout failed", err);
+        appendCommandOutput(t("codexLogout_failed", { error: msg }));
+      }
+    } else if (action === "codex-compact") {
+      if (effectiveAgent !== "codex") return;
+      if (!store.run || !store.sessionAlive) {
+        appendCommandOutput(t("codexCompact_noSession"));
+        return;
+      }
+      if (store.isRunning) {
+        appendCommandOutput(t("codexCompact_busy"));
+        return;
+      }
+      try {
+        await api.compactSession(store.run.id);
+        appendCommandOutput(t("codexCompact_done"));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        dbgWarn("chat", "codex compact failed", err);
+        appendCommandOutput(t("codexCompact_failed", { error: msg }));
+      }
+    } else if (action === "codex-rewind") {
+      if (effectiveAgent !== "codex") return;
+      if (!store.run || !store.sessionAlive) {
+        appendCommandOutput(t("codexRewind_noSession"));
+        return;
+      }
+      if (store.isRunning) {
+        appendCommandOutput(t("codexRewind_busy"));
+        return;
+      }
+      if (store.userTurnCount === 0) {
+        appendCommandOutput(t("codexRewind_noTurns"));
+        return;
+      }
+      openCodexRewind();
+    } else if (action === "codex-goal") {
+      if (effectiveAgent !== "codex") return;
+      if (!store.run) {
+        appendCommandOutput(t("codexGoal_noSession"));
+        return;
+      }
+      goalPanelOpen = true;
     }
   }
 
@@ -3172,6 +3821,29 @@
   let pageDragActive = $state(false);
   let dragProcessingCount = $state(0);
   let dragProcessing = $derived(dragProcessingCount > 0);
+
+  // Safety net: the native `tauri://drag-leave` / `drag-drop` events can be dropped on some
+  // platforms/webviews, leaving pageDragActive stuck true → the z-50 hover overlay swallows
+  // every click and the whole UI looks frozen. A pointerdown cannot reach the webview while an
+  // OS file-drag is in progress, so receiving one means the drag is over — force-clear the
+  // stale hover. Escape does the same. Does NOT touch dragProcessing (real in-flight work).
+  $effect(() => {
+    function clearStaleHover() {
+      if (pageDragActive) {
+        pageDragActive = false;
+        dbg("chat", "drag-hover safety-net cleared stale pageDragActive");
+      }
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") clearStaleHover();
+    }
+    window.addEventListener("pointerdown", clearStaleHover);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("pointerdown", clearStaleHover);
+      window.removeEventListener("keydown", onKey);
+    };
+  });
 
   /** Concurrency-limited parallel map returning PromiseSettledResult for each item. */
   async function handleTauriDrop(payload: { paths: string[] }) {
@@ -3656,9 +4328,20 @@
         Run
         <button
           class="font-mono text-amber-300 hover:text-amber-200 underline underline-offset-2 transition-colors"
-          onclick={() => sendMessage("/init", [])}>{t("chat_initHintAction")}</button
+          onclick={() => {
+            // Codex /init is a virtual handled by OpenCovibe (writes AGENTS.md
+            // via injected prompt). Claude /init is a CLI command — sending
+            // "/init" as a message lets Claude CLI handle it natively.
+            if (effectiveAgent === "codex") {
+              void handleVirtualCommand("init-project", "");
+            } else {
+              void sendMessage("/init", []);
+            }
+          }}>{t("chat_initHintAction")}</button
         >
-        to create CLAUDE.md
+        {effectiveAgent === "codex"
+          ? t("chat_initHintTargetAgents")
+          : t("chat_initHintTargetClaude")}
       </span>
       <button
         class="ml-auto text-muted-foreground/40 hover:text-muted-foreground/70 transition-colors"
@@ -3682,19 +4365,14 @@
 {/snippet}
 
 {#snippet heroMetaItems()}
-  {@const hasUpdate = !!(
-    cliVersionInfo?.installed &&
-    channelLatest &&
-    cliVersionInfo.installed !== channelLatest
-  )}
-  {#if cliVersionInfo?.installed}
+  {#if heroCliVersion}
     <button
       class="tabular-nums hover:text-muted-foreground transition-colors"
       onclick={() => goto("/release-notes")}
     >
-      {t("chat_cliVersion").replace("{version}", cliVersionInfo.installed)}
+      {t("chat_cliVersion").replace("{version}", heroCliVersion)}
     </button>
-    {#if hasUpdate}
+    {#if heroHasUpdate}
       <span class="text-primary/70">·</span>
       <button
         class="text-primary/70 hover:text-primary transition-colors"
@@ -3706,7 +4384,7 @@
     {/if}
   {/if}
   {#if remoteHosts.length > 0}
-    {#if cliVersionInfo?.installed}
+    {#if heroCliVersion}
       <span class="text-muted-foreground">·</span>
     {/if}
     <div class="relative inline-flex items-center">
@@ -3840,7 +4518,12 @@
       running={store.sessionAlive}
       run={store.run}
       agent={store.run?.agent ?? store.agent}
-      model={store.model}
+      model={effectiveAgent === "codex"
+        ? codexDisplayModel(store.run?.model) ||
+          codexDisplayModel(store.model) ||
+          getCodexDefaultModel() ||
+          ""
+        : store.model}
       cost={store.usage.cost}
       inputTokens={cumulativeTokens.input}
       outputTokens={cumulativeTokens.output}
@@ -3859,8 +4542,8 @@
       onToggleSidebar={toggleLayoutSidebar}
       mcpServers={store.mcpServers}
       onMcpToggle={() => (mcpPanelOpen = !mcpPanelOpen)}
-      cliVersion={store.cliVersion}
-      permissionMode={store.permissionMode}
+      cliVersion={effectiveAgent === "codex" ? (getCodexVersion() ?? "") : store.cliVersion}
+      permissionMode={store.features.permissionModeSwitch ? store.permissionMode : undefined}
       {platformModels}
       fastModeState={store.fastModeState}
       verbose={verboseEnabled}
@@ -3868,7 +4551,15 @@
       contextTokens={store.contextTokens}
       durationMs={store.durationMs}
       persistedFiles={store.persistedFiles}
-      onRewind={store.sessionAlive && !store.isRunning ? handleRewind : undefined}
+      onRewind={store.caps.supportsSnapshots && store.sessionAlive && !store.isRunning
+        ? handleRewind
+        : undefined}
+      onCodexRewind={effectiveAgent === "codex" &&
+      store.sessionAlive &&
+      !store.isRunning &&
+      store.userTurnCount > 0
+        ? openCodexRewind
+        : undefined}
       contextUtilization={store.contextUtilization}
       contextWarningLevel={store.contextWarningLevel}
       contextWindow={store.contextWindow}
@@ -3915,12 +4606,83 @@
           runId={store.run?.id ?? ""}
           mcpServers={store.mcpServers}
           sessionAlive={store.sessionAlive}
+          agent={effectiveAgent}
           onClose={() => (mcpPanelOpen = false)}
           onServersUpdate={(servers) => {
             store.updateMcpServers(servers);
           }}
         />
       </div>
+    {/if}
+
+    <!-- Codex turn diff pill (floating below status bar). Only Codex turns push an
+         aggregated diff; show the affordance once store.turnDiff is non-empty. -->
+    {#if effectiveAgent === "codex" && store.turnDiff.trim()}
+      <div class="absolute {statusBarExpanded ? 'top-16' : 'top-9'} right-3 z-30">
+        <button
+          type="button"
+          class="flex items-center gap-1.5 rounded-full border border-border bg-background/90 px-2.5 py-1 text-xs font-medium text-foreground shadow-sm backdrop-blur hover:bg-muted/60 transition-colors"
+          onclick={() => {
+            dbg("chat", "turn diff open", { len: store.turnDiff.length });
+            turnDiffOpen = true;
+          }}
+          title="View the aggregated diff for the current turn"
+        >
+          <svg
+            class="h-3.5 w-3.5 text-muted-foreground"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+          >
+            <path d="M9 3v18M3 9h18M3 15h18" />
+          </svg>
+          Turn diff
+        </button>
+      </div>
+    {/if}
+
+    <!-- Codex features pill + panel (floating below status bar). Live Codex session only —
+         experimentalFeature/list needs an app-server connection. Offset left of the turn-diff
+         pill (right-3) so the two affordances don't collide. -->
+    {#if effectiveAgent === "codex" && store.sessionAlive && store.run}
+      {@const featuresRight = store.turnDiff.trim() ? "right-28" : "right-3"}
+      <div class="absolute {statusBarExpanded ? 'top-16' : 'top-9'} {featuresRight} z-30">
+        <button
+          type="button"
+          class="flex items-center gap-1.5 rounded-full border border-border bg-background/90 px-2.5 py-1 text-xs font-medium text-foreground shadow-sm backdrop-blur hover:bg-muted/60 transition-colors {featuresPanelOpen
+            ? 'bg-muted/60'
+            : ''}"
+          onclick={() => {
+            featuresPanelOpen = !featuresPanelOpen;
+            dbg("features", "toggle panel", { open: featuresPanelOpen });
+          }}
+          title={t("features_title")}
+        >
+          <svg
+            class="h-3.5 w-3.5 text-muted-foreground"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1" />
+            <circle cx="12" cy="12" r="3.5" />
+          </svg>
+          {t("features_title")}
+        </button>
+      </div>
+      {#if featuresPanelOpen}
+        <div class="absolute {statusBarExpanded ? 'top-24' : 'top-16'} right-3 z-40">
+          <FeaturesPanel
+            runId={store.run.id}
+            sessionAlive={store.sessionAlive}
+            onClose={() => (featuresPanelOpen = false)}
+          />
+        </div>
+      {/if}
     {/if}
 
     <!-- Preview URL input bar -->
@@ -3987,8 +4749,8 @@
 
     <!-- Main area -->
     <div class="flex-1 overflow-hidden relative">
-      {#if store.useStreamSession}
-        <!-- API mode: chat messages -->
+      {#if store.useChatTimeline}
+        <!-- API / Codex bus-events mode: chat messages -->
         <div
           class="h-full overflow-y-auto"
           style="overflow-anchor:auto"
@@ -4002,6 +4764,9 @@
                 <div class="text-center animate-slide-up">
                   <img src="/logo.png?v=2" alt="OC" class="mx-auto mb-4 h-12 w-12 rounded-2xl" />
                   <h2 class="text-lg font-semibold text-primary mb-1">{t("layout_appName")}</h2>
+                  {#if codexWarning}
+                    <p class="text-amber-500 text-sm mb-3 px-2">{codexWarning}</p>
+                  {/if}
                   {#if !store.run}
                     {@const welcomeCwd =
                       store.effectiveCwd ||
@@ -4049,18 +4814,20 @@
                 <div
                   class="mt-4 flex items-center justify-center gap-1.5 text-xs text-muted-foreground"
                 >
-                  <AuthSourceBadge
+                  <!-- Agent switcher in the hero, synced with the composer's AgentSelector
+                       (both call handleAgentChange → store.agent). Switching here also swaps the
+                       auth badge below (OAuth / API Key, per agent). -->
+                  <AgentSelector value={effectiveAgent} onchange={(a) => handleAgentChange(a)} />
+                  <span class="text-muted-foreground">·</span>
+                  <AgentAuthBadge
+                    agent={effectiveAgent}
                     {authOverview}
-                    authSourceLabel={store.authSourceLabel}
-                    authSourceCategory={store.authSourceCategory}
-                    apiKeySource={store.apiKeySource}
-                    hasRun={false}
-                    authMode={store.authMode}
-                    platformCredentials={settings?.platform_credentials ?? []}
-                    platformId={store.platformId ?? "anthropic"}
                     onAuthModeChange={handleAuthModeChange}
-                    onPlatformChange={handlePlatformChange}
-                    {localProxyStatuses}
+                    codexProvider={settings?.codex_provider ?? null}
+                    onChanged={async () => {
+                      settings = await api.getUserSettings();
+                    }}
+                    hasRun={false}
                     variant="hero"
                   />
                   <span class="text-muted-foreground">·</span>
@@ -4224,7 +4991,10 @@
                           timestamp: entry.ts,
                         }}
                         attachments={entry.attachments}
-                        onRewind={entry.cliUuid && store.sessionAlive && !store.isRunning
+                        onRewind={store.caps.supportsSnapshots &&
+                        entry.cliUuid &&
+                        store.sessionAlive &&
+                        !store.isRunning
                           ? () =>
                               handleRewindToMessage({
                                 cliUuid: entry.cliUuid!,
@@ -4242,6 +5012,7 @@
                           timestamp: entry.ts,
                         }}
                         thinkingText={entry.thinkingText}
+                        agent={store.agent}
                       />
                     {:else if entry.kind === "tool"}
                       {#if claudeTurnStarts.has(i)}
@@ -4272,6 +5043,7 @@
                               latestPlanTool={entry.kind === "tool" &&
                                 entry.tool.tool_use_id === latestPlanToolId}
                               showPermissionInPanel={showPermissionPanel}
+                              {agentDisplayName}
                               onPreviewFile={openPreviewForPath}
                             />
                           </div>
@@ -4316,6 +5088,13 @@
                           </div>
                         </div>
                       </div>
+                    {:else if entry.kind === "hook"}
+                      <HookExecutionCard
+                        eventName={entry.eventName}
+                        status={entry.status}
+                        statusMessage={entry.statusMessage}
+                        durationMs={entry.durationMs}
+                      />
                     {/if}
                   </div>
                 {/if}
@@ -4471,7 +5250,9 @@
                   <div class="chat-content-width py-4">
                     <div class="mb-1.5 flex items-center gap-2">
                       <div
-                        class="flex h-5 w-5 items-center justify-center rounded-sm bg-orange-500/10 text-orange-500"
+                        class="flex h-5 w-5 items-center justify-center rounded-sm {isCodexAgent
+                          ? 'bg-emerald-500/10 text-emerald-500'
+                          : 'bg-orange-500/10 text-orange-500'}"
                       >
                         <svg
                           class="h-3 w-3"
@@ -4482,12 +5263,23 @@
                           stroke-linecap="round"
                           stroke-linejoin="round"
                         >
-                          <path
-                            d="M12 3l1.912 5.813a2 2 0 0 0 1.275 1.275L21 12l-5.813 1.912a2 2 0 0 0-1.275 1.275L12 21l-1.912-5.813a2 2 0 0 0-1.275-1.275L3 12l5.813-1.912a2 2 0 0 0 1.275-1.275L12 3z"
-                          />
+                          {#if isCodexAgent}
+                            <polyline points="4 17 10 11 4 5" /><line
+                              x1="12"
+                              x2="20"
+                              y1="19"
+                              y2="19"
+                            />
+                          {:else}
+                            <path
+                              d="M12 3l1.912 5.813a2 2 0 0 0 1.275 1.275L21 12l-5.813 1.912a2 2 0 0 0-1.275 1.275L12 21l-1.912-5.813a2 2 0 0 0-1.275-1.275L3 12l5.813-1.912a2 2 0 0 0 1.275-1.275L12 3z"
+                            />
+                          {/if}
                         </svg>
                       </div>
-                      <span class="text-sm font-semibold text-foreground">{t("chat_claude")}</span>
+                      <span class="text-sm font-semibold text-foreground"
+                        >{assistantDisplayName}</span
+                      >
                     </div>
                     <div class="pl-7 prose-chat">
                       <MarkdownContent text={store.streamingText} streaming={true} />
@@ -4516,7 +5308,9 @@
                   <div class="chat-content-width py-4">
                     <div class="mb-1.5 flex items-center gap-2">
                       <div
-                        class="flex h-5 w-5 items-center justify-center rounded-sm bg-orange-500/10 text-orange-500"
+                        class="flex h-5 w-5 items-center justify-center rounded-sm {isCodexAgent
+                          ? 'bg-emerald-500/10 text-emerald-500'
+                          : 'bg-orange-500/10 text-orange-500'}"
                       >
                         <svg
                           class="h-3 w-3"
@@ -4527,12 +5321,23 @@
                           stroke-linecap="round"
                           stroke-linejoin="round"
                         >
-                          <path
-                            d="M12 3l1.912 5.813a2 2 0 0 0 1.275 1.275L21 12l-5.813 1.912a2 2 0 0 0-1.275 1.275L12 21l-1.912-5.813a2 2 0 0 0-1.275-1.275L3 12l5.813-1.912a2 2 0 0 0 1.275-1.275L12 3z"
-                          />
+                          {#if isCodexAgent}
+                            <polyline points="4 17 10 11 4 5" /><line
+                              x1="12"
+                              x2="20"
+                              y1="19"
+                              y2="19"
+                            />
+                          {:else}
+                            <path
+                              d="M12 3l1.912 5.813a2 2 0 0 0 1.275 1.275L21 12l-5.813 1.912a2 2 0 0 0-1.275 1.275L12 21l-1.912-5.813a2 2 0 0 0-1.275-1.275L3 12l5.813-1.912a2 2 0 0 0 1.275-1.275L12 3z"
+                            />
+                          {/if}
                         </svg>
                       </div>
-                      <span class="text-sm font-semibold text-foreground">{t("chat_claude")}</span>
+                      <span class="text-sm font-semibold text-foreground"
+                        >{assistantDisplayName}</span
+                      >
                       {#if thinkingElapsed > 0}
                         <span class="ml-auto text-[10px] tabular-nums text-muted-foreground"
                           >{formatElapsed(thinkingElapsed)}</span
@@ -4621,6 +5426,9 @@
           <div class="text-center max-w-md animate-slide-up">
             <img src="/logo.png?v=2" alt="OC" class="mx-auto mb-4 h-12 w-12 rounded-2xl" />
             <h2 class="text-lg font-semibold text-primary mb-2">{t("layout_appName")}</h2>
+            {#if codexWarning}
+              <p class="text-amber-500 text-sm mb-3 px-2">{codexWarning}</p>
+            {/if}
             <p class="text-sm text-muted-foreground mb-4">
               {store.run ? t("chat_typeToStartSession") : t("chat_startSessionHint")}
             </p>
@@ -4801,6 +5609,7 @@
       <PermissionPanel
         pendingTools={pendingToolPermissions}
         onPermissionRespond={handlePermissionRespond}
+        {agentDisplayName}
       />
     {/if}
 
@@ -4890,67 +5699,78 @@
       onList={() => store.sendMessage("Show me my scheduled tasks", [])}
     />
 
+    <TodoPanel tasks={store.panelTasks} />
+
     {#if store.sessionAlive || !store.run || store.phase === "empty" || store.phase === "ready" || TERMINAL_PHASES.includes(store.phase)}
-      <PromptInput
-        bind:this={promptRef}
-        agent={store.agent}
-        running={store.isActivelyRunning}
-        disabled={inputBlockedByPermission}
-        pendingPermission={store.hasInlinePermission}
-        hasRun={!!store.run}
-        sessionAlive={store.sessionAlive}
-        canResume={!store.sessionAlive &&
-          canResumeNow(store.run, store.phase, agentSettings?.no_session_persistence ?? false)}
-        useStreamSession={store.useStreamSession}
-        isRemote={store.isRemote}
-        cliCommands={store.sessionInitReceived && store.sessionCommands.length > 0
-          ? store.sessionCommands
-          : mergeProjectCommands(getCliCommands(), projectCommands)}
-        models={effectiveModels}
-        currentModel={store.model}
-        permissionMode={store.permissionMode}
-        cwd={store.effectiveCwd ||
-          folderCwdOverride ||
-          localStorage.getItem("ocv:project-cwd") ||
-          ""}
-        authMode={store.authMode}
-        platformId={store.platformId ?? "anthropic"}
-        platformCredentials={settings?.platform_credentials ?? []}
-        onSend={sendMessage}
-        onBtwSend={handleBtwSend}
-        onAgentChange={undefined}
-        onInterrupt={() => store.interrupt()}
-        onModelSwitch={handleModelChange}
-        onPermissionModeChange={store.features.permissionModeSwitch
-          ? handlePermissionModeChange
-          : undefined}
-        onVirtualCommand={handleVirtualCommand}
-        fastModeState={store.fastModeState}
-        onFastModeSwitch={handleFastModeSwitch}
-        onPlatformChange={handlePlatformChange}
-        {authOverview}
-        authSourceLabel={store.authSourceLabel}
-        authSourceCategory={store.authSourceCategory}
-        apiKeySource={store.apiKeySource}
-        onAuthModeChange={handleAuthModeChange}
-        {localProxyStatuses}
-        showAuthBadge={!welcomeVisible}
-        onShortcutHelp={() => (shortcutHelpOpen = !shortcutHelpOpen)}
-        availableSkills={store.availableSkills}
-        {skillItems}
-        agents={preloadedAgents.map((a) => ({ name: a.name, description: a.description }))}
-        hasStash={!!stashedInput}
-        {userHistory}
-        runId={store.run?.id ?? ""}
-        onRestoreStash={() => {
-          if (stashedInput) {
-            promptRef?.restoreSnapshot(stashedInput);
-            stashedInput = null;
-            showChatToast(t("toast_stashRestored"));
-            dbg("chat", "stash restored via badge click");
-          }
-        }}
-      />
+      <!-- Key on run id so each chat gets a clean PromptInput, seeded from its own saved draft -->
+      {#key store.run?.id ?? ""}
+        <PromptInput
+          bind:this={promptRef}
+          agent={effectiveAgent}
+          running={store.isActivelyRunning}
+          disabled={inputBlockedByPermission}
+          pendingPermission={store.hasInlinePermission}
+          hasRun={!!store.run}
+          sessionAlive={store.sessionAlive}
+          canResume={!store.sessionAlive &&
+            canResumeNow(store.run, store.phase, agentSettings?.no_session_persistence ?? false)}
+          useStreamSession={store.useStreamSession}
+          slashCommandMenu={getAgentFeatures(effectiveAgent).slashCommandMenu}
+          isRemote={store.isRemote}
+          cliCommands={store.sessionInitReceived && store.sessionCommands.length > 0
+            ? store.sessionCommands
+            : effectiveAgent === "codex"
+              ? []
+              : mergeProjectCommands(getCliCommands(), projectCommands)}
+          models={store.useStreamSession || effectiveAgent === "codex" ? effectiveModels : []}
+          currentModel={store.model}
+          permissionMode={store.features.permissionModeSwitch ? store.permissionMode : "default"}
+          cwd={store.effectiveCwd ||
+            folderCwdOverride ||
+            localStorage.getItem("ocv:project-cwd") ||
+            ""}
+          authMode={store.authMode}
+          platformId={store.platformId ?? "anthropic"}
+          platformCredentials={settings?.platform_credentials ?? []}
+          onSend={sendMessage}
+          onBtwSend={handleBtwSend}
+          onAgentChange={handleAgentChange}
+          onInterrupt={() => store.interrupt()}
+          onModelSwitch={handleModelChange}
+          onPermissionModeChange={store.features.permissionModeSwitch
+            ? handlePermissionModeChange
+            : undefined}
+          onVirtualCommand={handleVirtualCommand}
+          fastModeState={store.fastModeState}
+          onFastModeSwitch={handleFastModeSwitch}
+          onPlatformChange={handlePlatformChange}
+          {authOverview}
+          authSourceLabel={store.authSourceLabel}
+          authSourceCategory={store.authSourceCategory}
+          apiKeySource={store.apiKeySource}
+          onAuthModeChange={handleAuthModeChange}
+          {localProxyStatuses}
+          showAuthBadge={!welcomeVisible && store.useStreamSession}
+          onShortcutHelp={() => (shortcutHelpOpen = !shortcutHelpOpen)}
+          availableSkills={store.availableSkills}
+          {skillItems}
+          codexSkillItems={codexRuntimeSkills}
+          agents={preloadedAgents.map((a) => ({ name: a.name, description: a.description }))}
+          hasStash={!!stashedInput}
+          {userHistory}
+          runId={store.run?.id ?? ""}
+          initialDraft={promptDraftsByRun.get(store.run?.id ?? "")}
+          onDraftChange={savePromptDraft}
+          onRestoreStash={() => {
+            if (stashedInput) {
+              promptRef?.restoreSnapshot(stashedInput);
+              stashedInput = null;
+              showChatToast(t("toast_stashRestored"));
+              dbg("chat", "stash restored via badge click");
+            }
+          }}
+        />
+      {/key}
     {/if}
   </div>
 
@@ -5006,6 +5826,20 @@
       });
     }}
   />
+
+  <CodexReviewModal bind:open={codexReviewPickerOpen} onSubmit={runCodexReview} />
+
+  <!-- Codex turn diff: supplied-diff mode (no git fetch, no staged/unstaged tabs). -->
+  <DiffModal bind:open={turnDiffOpen} title="Turn diff" diffText={store.turnDiff} />
+
+  <RewindCodexModal
+    bind:open={codexRewindOpen}
+    turns={codexRewindTurns}
+    busy={codexRewindBusy}
+    onConfirm={runCodexRewind}
+  />
+
+  <GoalPanel bind:open={goalPanelOpen} runId={store.run?.id} goal={store.goal} />
 
   <ShortcutHelpPanel bind:open={shortcutHelpOpen} />
 

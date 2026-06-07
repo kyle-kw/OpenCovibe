@@ -47,6 +47,22 @@ function formatReport(r: DiagnosticsReport, mcpServers?: McpServerInfo[]): strin
     lines.push(`❌ ${t("doctor_cliNotFound")}`);
   }
 
+  // ── Codex CLI ──
+  if (r.codex) {
+    lines.push("");
+    lines.push(`## ${t("doctor_sectionCodex")}`);
+    if (r.codex.installed) {
+      lines.push(`✅ ${t("doctor_codexInstalled", { version: r.codex.version ?? "unknown" })}`);
+      lines.push(
+        r.codex.logged_in
+          ? `✅ ${t("doctor_codexLoggedIn", { method: r.codex.auth_method ?? "unknown" })}`
+          : `⚠️ ${t("doctor_codexNotLoggedIn")}`,
+      );
+    } else {
+      lines.push(`⚠️ ${t("doctor_codexNotInstalled")}`);
+    }
+  }
+
   // ── Authentication ──
   lines.push("");
   lines.push(`## ${t("doctor_sectionAuth")}`);
@@ -88,6 +104,19 @@ function formatReport(r: DiagnosticsReport, mcpServers?: McpServerInfo[]): strin
       lines.push(
         `⚠️ ${t("doctor_projectLargeFile", { path: f.path, size: String(f.size_chars) })}`,
       );
+    }
+  }
+  // Codex AGENTS.md — section hidden entirely when none exist (matches doctor convention).
+  if (r.project.has_agents_md) {
+    lines.push("");
+    lines.push(`### ${t("doctor_projectAgentsMdTitle")}`);
+    for (const f of r.project.agents_md_files) {
+      lines.push(`- ${f.path} (${f.size_chars} chars)`);
+      if (f.size_chars > LARGE_FILE_THRESHOLD) {
+        lines.push(
+          `⚠️ ${t("doctor_projectLargeFile", { path: f.path, size: String(f.size_chars) })}`,
+        );
+      }
     }
   }
 

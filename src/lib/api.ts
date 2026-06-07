@@ -19,6 +19,7 @@ import type {
   UsageOverview,
   BusEvent,
   CliInfo,
+  CodexModelList,
   SessionMode,
   TeamSummary,
   TeamConfig,
@@ -43,6 +44,9 @@ import type {
   AgentDefinitionSummary,
   RunSearchFilters,
   RunSearchResponse,
+  CodexAuthResult,
+  ThreadGoal,
+  GoalStatus,
 } from "./types";
 
 // Runs
@@ -185,13 +189,21 @@ export async function sendChatMessage(
   message: string,
   attachments?: Attachment[],
   model?: string,
+  clientUuid?: string,
 ): Promise<void> {
   dbg("api", "sendChatMessage", {
     runId,
     msgLen: message.length,
     attachments: attachments?.length ?? 0,
+    clientUuid,
   });
-  return invoke("send_chat_message", { runId, message, attachments, model });
+  return invoke("send_chat_message", {
+    runId,
+    message,
+    attachments,
+    model,
+    clientUuid: clientUuid ?? null,
+  });
 }
 
 // CLI sync
@@ -321,6 +333,19 @@ export async function listMemoryFiles(
 }
 
 // Files
+
+/** Check whether `{cwd}/AGENTS.md` exists.
+ *
+ * Narrow by design — only the AGENTS.md filename is checkable (hardcoded
+ * backend-side). Used by the Codex `/init` flow to decide whether to skip
+ * rather than overwrite. Backend rejects empty / relative / `..`-containing
+ * cwds; this is not a general filesystem probe.
+ */
+export async function agentsMdExists(cwd: string): Promise<boolean> {
+  dbg("api", "agentsMdExists", { cwd });
+  return invoke<boolean>("agents_md_exists", { cwd });
+}
+
 export async function readTextFile(path: string, cwd?: string): Promise<string> {
   dbg("api", "readTextFile", path, { cwd });
   return perfMarkAsync(
@@ -378,6 +403,37 @@ export async function getHeatmapDaily(
 }
 
 // Diagnostics
+export async function checkCodexAuth(): Promise<CodexAuthResult> {
+  return invoke<CodexAuthResult>("check_codex_auth");
+}
+
+/** One `codex doctor` check (install/config/auth/runtime/app-server health). */
+export interface CodexDoctorCheck {
+  id: string;
+  category: string;
+  status: string; // "ok" | "warn" | "fail" | ...
+  summary: string;
+  details?: Record<string, unknown>;
+  remediation?: string | null;
+  durationMs?: number;
+}
+
+/** Structured `codex doctor --json` report. */
+export interface CodexDoctorReport {
+  schemaVersion: number;
+  generatedAt: string;
+  overallStatus: string; // "ok" | "warn" | "fail"
+  codexVersion: string;
+  checks: Record<string, CodexDoctorCheck>;
+}
+
+/** Run `codex doctor --json` — richer than checkCodexAuth (install/config/auth/runtime/app-server).
+ *  Rejects when codex is absent / can't run / output isn't JSON. */
+export async function runCodexDoctor(): Promise<CodexDoctorReport> {
+  dbg("api", "runCodexDoctor");
+  return invoke<CodexDoctorReport>("run_codex_doctor");
+}
+
 export async function checkAgentCli(agent: string): Promise<CliCheckResult> {
   dbg("api", "checkAgentCli", agent);
   return invoke<CliCheckResult>("check_agent_cli", { agent });
@@ -461,6 +517,14 @@ export async function getCliInfo(forceRefresh?: boolean): Promise<CliInfo> {
   }
 }
 
+export async function getCodexModels(forceRefresh?: boolean): Promise<CodexModelList> {
+  dbg("api", "getCodexModels", { forceRefresh });
+  // Backend already substitutes a minimal fallback on failure, so this rarely throws.
+  const list = await invoke<CodexModelList>("get_codex_models", { forceRefresh });
+  dbg("api", "getCodexModels →", { models: list.models.length });
+  return list;
+}
+
 // Session (event bus)
 export async function startSession(
   runId: string,
@@ -495,16 +559,23 @@ export async function sendSessionMessage(
   runId: string,
   message: string,
   attachments?: Array<{ content_base64: string; media_type: string; filename: string }>,
+  // Structured Codex skill refs — sent as {type:"skill", name, path} UserInput items so the
+  // agent actually triggers the skill. `path` is required by the backend; sourcing name+path
+  // from the runtime skills list (not from typed "/name" text) is what makes this valid.
+  // Omitted/empty = unchanged behavior (Claude + Codex-without-skill).
+  skills?: Array<{ name: string; path: string }>,
 ): Promise<void> {
   dbg("api", "sendSessionMessage", {
     runId,
     msgLen: message.length,
     attachments: attachments?.length ?? 0,
+    skills: skills?.length ?? 0,
   });
   return invoke("send_session_message", {
     runId,
     message,
     attachments: attachments ?? null,
+    skills: skills && skills.length > 0 ? skills : null,
   });
 }
 
@@ -636,12 +707,100 @@ export async function setPermissionMode(runId: string, mode: string) {
   return sendSessionControl(runId, "set_permission_mode", { mode });
 }
 
+/** Set reasoning effort live (Codex app-server: applies on the next turn). */
+export async function setEffort(runId: string, effort: string) {
+  return sendSessionControl(runId, "set_effort", { effort });
+}
+
+/** Inject guidance into the currently-running turn without interrupting it
+ *  (Codex app-server `turn/steer`). Routed by the store when a Codex turn is
+ *  running and the user sends from the mid-turn send button. */
+export async function steerSession(runId: string, text: string) {
+  return sendSessionControl(runId, "steer", { text });
+}
+
 export async function setMaxThinkingTokens(runId: string, tokens: number) {
   return sendSessionControl(runId, "set_max_thinking_tokens", { max_thinking_tokens: tokens });
 }
 
 export async function getMcpStatus(runId: string) {
   return sendSessionControl(runId, "mcp_status");
+}
+
+/** A skill the Codex agent actually sees this session (vs the static file-scan list).
+ *  Mirrors Codex 0.136 `SkillMetadata` (only the fields we render). `scope` is the
+ *  load origin: user | repo | system | admin. */
+export interface CodexRuntimeSkill {
+  name: string;
+  description: string;
+  shortDescription?: string;
+  path: string;
+  scope: "user" | "repo" | "system" | "admin";
+  enabled: boolean;
+}
+
+/** One cwd's resolved skill set, plus any per-skill load errors. Mirrors `SkillsListEntry`. */
+export interface CodexRuntimeSkillsEntry {
+  cwd: string;
+  skills: CodexRuntimeSkill[];
+  errors: { path: string; message: string }[];
+}
+
+/** Ask the live Codex app-server which skills the agent actually loaded this session
+ *  (`skills/list`). Reply shape: `{data: SkillsListEntry[]}`. Caller MUST gate on a live
+ *  Codex session — there is no static fallback here, it speaks to the running process. */
+export async function listCodexSkillsRuntime(
+  runId: string,
+): Promise<{ data: CodexRuntimeSkillsEntry[] }> {
+  const result = await sendSessionControl(runId, "skills_list");
+  return result as unknown as { data: CodexRuntimeSkillsEntry[] };
+}
+
+/** A Codex feature flag + its current enablement, from `experimentalFeature/list`. `stage` is the
+ *  lifecycle (ExperimentalFeatureStage): "beta" | "underDevelopment" | "stable" | "deprecated" |
+ *  "removed". displayName/description/announcement are null for non-beta features. */
+export interface CodexFeature {
+  name: string;
+  stage: string;
+  displayName: string | null;
+  description: string | null;
+  announcement: string | null;
+  enabled: boolean;
+  defaultEnabled: boolean;
+}
+
+/** List Codex feature flags for the live session's config (incl. project-local). Needs a live
+ *  Codex session (app-server request). */
+export async function listCodexFeatures(runId: string): Promise<{ data: CodexFeature[] }> {
+  const result = await sendSessionControl(runId, "experimental_feature_list");
+  return result as unknown as { data: CodexFeature[] };
+}
+
+/** Durably toggle one `[features].<name>` flag (nested config write; preserves the rest of the
+ *  table). `enabled=null` clears the override back to Codex's default. Effective next session. */
+export async function setCodexFeature(name: string, enabled: boolean | null): Promise<unknown> {
+  dbg("api", "setCodexFeature", { name, enabled });
+  return invoke("set_codex_feature", { name, enabled });
+}
+
+/** One model from Codex's authoritative `model/list` catalog (only the fields we render). */
+export interface CodexModel {
+  id: string;
+  model: string;
+  displayName: string;
+  description: string;
+  hidden: boolean;
+  supportedReasoningEfforts: { reasoningEffort: string; description: string }[];
+  defaultReasoningEffort: string;
+  supportsPersonality: boolean;
+  isDefault: boolean;
+}
+
+/** Authoritative model catalog from the live Codex CLI (`model/list`). Needs a live session;
+ *  callers cache the result so the (sessionless) picker stays accurate across CLI versions. */
+export async function listCodexModels(runId: string): Promise<{ data: CodexModel[] }> {
+  const result = await sendSessionControl(runId, "model_list");
+  return result as unknown as { data: CodexModel[] };
 }
 
 export async function setMcpServers(runId: string, servers: Record<string, unknown>) {
@@ -695,6 +854,49 @@ export async function cancelControlRequest(runId: string, requestId: string) {
   return invoke("cancel_control_request", { runId, requestId });
 }
 
+// ── Codex Wave-3: thread lifecycle (compact / rewind / goal) ──
+
+/** Codex `thread/compact/start`: clears history but keeps a summary in context. */
+export async function compactSession(runId: string) {
+  return sendSessionControl(runId, "compact");
+}
+
+/**
+ * Codex `thread/rollback`: drops the last N turns from conversation HISTORY.
+ * ⚠️ Does NOT revert file changes (unlike Claude's snapshot rewind).
+ */
+export async function rollbackTurns(runId: string, numTurns: number) {
+  return sendSessionControl(runId, "rollback", { num_turns: numTurns });
+}
+
+/** Codex `thread/goal/set`: set or update the session objective + budget. */
+export async function setGoal(
+  runId: string,
+  goal: { objective?: string; status?: GoalStatus; tokenBudget?: number },
+) {
+  return sendSessionControl(runId, "goal_set", {
+    ...(goal.objective !== undefined ? { objective: goal.objective } : {}),
+    ...(goal.status !== undefined ? { status: goal.status } : {}),
+    ...(goal.tokenBudget !== undefined ? { token_budget: goal.tokenBudget } : {}),
+  });
+}
+
+/**
+ * Codex `thread/goal/get`: read the current goal.
+ * Backend forwards the JSON-RPC result verbatim — `{ goal: ThreadGoal | null }`
+ * — so we unwrap the `goal` key here. Returns null when no objective is set.
+ */
+export async function getGoal(runId: string): Promise<ThreadGoal | null> {
+  const res = await sendSessionControl(runId, "goal_get");
+  const goal = (res as { goal?: ThreadGoal | null }).goal;
+  return goal ?? null;
+}
+
+/** Codex `thread/goal/clear`: remove the current objective. */
+export async function clearGoal(runId: string) {
+  return sendSessionControl(runId, "goal_clear");
+}
+
 export async function respondElicitation(
   runId: string,
   requestId: string,
@@ -708,6 +910,17 @@ export async function respondElicitation(
     action,
     content: content ?? null,
   });
+}
+
+/** Answer a Codex `request_user_input` (multiple-choice) prompt over the app-server
+ *  transport. `answers` maps each question id to the selected option label(s). */
+export async function respondUserInput(
+  runId: string,
+  requestId: string,
+  answers: Record<string, string[]>,
+): Promise<void> {
+  dbg("api", "respondUserInput", { runId, requestId });
+  return invoke("respond_user_input", { runId, requestId, answers });
 }
 
 // ── Teams ──
@@ -835,6 +1048,56 @@ export async function updateSkill(path: string, content: string, cwd?: string): 
 export async function deleteSkill(path: string, cwd?: string): Promise<void> {
   dbg("api", "deleteSkill", { path, cwd });
   return invoke<void>("delete_skill", { path, cwd: cwd ?? null });
+}
+
+// ── Codex Skills ──
+
+export async function listCodexSkills(cwd?: string): Promise<StandaloneSkill[]> {
+  dbg("api", "listCodexSkills", { cwd });
+  return invoke<StandaloneSkill[]>("list_codex_skills", { cwd: cwd ?? null });
+}
+
+export async function createCodexSkill(
+  name: string,
+  description: string,
+  content: string,
+  scope: string,
+  cwd?: string,
+): Promise<StandaloneSkill> {
+  dbg("api", "createCodexSkill", { name, scope, cwd });
+  return invoke<StandaloneSkill>("create_codex_skill", {
+    name,
+    description,
+    content,
+    scope,
+    cwd: cwd ?? null,
+  });
+}
+
+export async function deleteCodexSkill(path: string, cwd?: string): Promise<void> {
+  dbg("api", "deleteCodexSkill", { path, cwd });
+  return invoke<void>("delete_codex_skill", { path, cwd: cwd ?? null });
+}
+
+export async function toggleCodexSkill(
+  skillPath: string,
+  enabled: boolean,
+  cwd?: string,
+): Promise<void> {
+  dbg("api", "toggleCodexSkill", { skillPath, enabled, cwd });
+  return invoke<void>("toggle_codex_skill", { skillPath, enabled, cwd: cwd ?? null });
+}
+
+// ── Codex Plugins ──
+
+export async function listCodexInstalledPlugins(): Promise<InstalledPlugin[]> {
+  dbg("api", "listCodexInstalledPlugins");
+  return invoke<InstalledPlugin[]>("list_codex_installed_plugins");
+}
+
+export async function toggleCodexPlugin(pluginId: string, enabled: boolean): Promise<void> {
+  dbg("api", "toggleCodexPlugin", { pluginId, enabled });
+  return invoke<void>("toggle_codex_plugin", { pluginId, enabled });
 }
 
 export async function listInstalledPlugins(): Promise<InstalledPlugin[]> {
@@ -989,6 +1252,34 @@ export async function removeMcpServer(
   });
 }
 
+// ── Codex MCP ──
+
+export async function listCodexMcpServers(cwd?: string): Promise<ConfiguredMcpServer[]> {
+  dbg("api", "listCodexMcpServers", { cwd });
+  return invoke<ConfiguredMcpServer[]>("list_codex_mcp_servers", { cwd: cwd ?? null });
+}
+
+export async function addCodexMcpServer(
+  name: string,
+  config: Record<string, unknown>,
+): Promise<PluginOperationResult> {
+  dbg("api", "addCodexMcpServer", { name });
+  return invoke<PluginOperationResult>("add_codex_mcp_server", { name, config });
+}
+
+export async function removeCodexMcpServer(
+  name: string,
+  scope: string,
+  cwd?: string,
+): Promise<PluginOperationResult> {
+  dbg("api", "removeCodexMcpServer", { name, scope, cwd });
+  return invoke<PluginOperationResult>("remove_codex_mcp_server", {
+    name,
+    scope,
+    cwd: cwd ?? null,
+  });
+}
+
 export async function checkMcpRegistryHealth(): Promise<ProviderHealth> {
   dbg("api", "checkMcpRegistryHealth");
   return invoke<ProviderHealth>("check_mcp_registry_health");
@@ -1054,6 +1345,42 @@ export async function updateCliConfig(
   return invoke<Record<string, unknown>>("update_cli_config", { patch });
 }
 
+// ── Codex Hooks ──
+
+export async function getCodexHooks(): Promise<{
+  hooks: Record<string, unknown>;
+  warning?: string;
+}> {
+  dbg("api", "getCodexHooks");
+  return invoke("get_codex_hooks");
+}
+
+export async function updateCodexHooks(
+  hooks: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  dbg("api", "updateCodexHooks");
+  return invoke("update_codex_hooks", { hooks });
+}
+
+// ── Codex Config ──
+
+export async function getCodexConfig(): Promise<import("./types").CodexConfigResult> {
+  dbg("api", "getCodexConfig");
+  return invoke<import("./types").CodexConfigResult>("get_codex_config");
+}
+
+export async function getProjectCodexConfig(cwd: string): Promise<Record<string, unknown>> {
+  dbg("api", "getProjectCodexConfig", { cwd });
+  return invoke<Record<string, unknown>>("get_project_codex_config", { cwd });
+}
+
+export async function updateCodexConfig(
+  patch: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  dbg("api", "updateCodexConfig", { patch });
+  return invoke<Record<string, unknown>>("update_codex_config", { patch });
+}
+
 // ── App Updates ──
 
 export async function checkForUpdates(): Promise<import("./types").UpdateInfo> {
@@ -1075,14 +1402,26 @@ export async function checkAuthStatus(): Promise<import("./types").AuthCheckResu
   return invoke<import("./types").AuthCheckResult>("check_auth_status");
 }
 
-export async function detectInstallMethods(): Promise<import("./types").InstallMethod[]> {
-  dbg("api", "detectInstallMethods");
-  return invoke<import("./types").InstallMethod[]>("detect_install_methods");
+export async function detectInstallMethods(
+  agent: "claude" | "codex" = "claude",
+): Promise<import("./types").InstallMethod[]> {
+  dbg("api", "detectInstallMethods", { agent });
+  return invoke<import("./types").InstallMethod[]>("detect_install_methods", { agent });
 }
 
 export async function runClaudeLogin(): Promise<boolean> {
   dbg("api", "runClaudeLogin");
   return invoke<boolean>("run_claude_login");
+}
+
+export async function runCodexLogin(): Promise<boolean> {
+  dbg("api", "runCodexLogin");
+  return invoke<boolean>("run_codex_login");
+}
+
+export async function runCodexLogout(): Promise<boolean> {
+  dbg("api", "runCodexLogout");
+  return invoke<boolean>("run_codex_logout");
 }
 
 export async function getAuthOverview(): Promise<import("./types").AuthOverview> {
@@ -1169,6 +1508,11 @@ export async function getLocalIp(preferV6: boolean): Promise<string | null> {
 export async function listAgents(cwd?: string): Promise<AgentDefinitionSummary[]> {
   dbg("api", "listAgents", { cwd });
   return invoke<AgentDefinitionSummary[]>("list_agents", { cwd: cwd ?? null });
+}
+
+export async function listCodexAgents(): Promise<AgentDefinitionSummary[]> {
+  dbg("api", "listCodexAgents");
+  return invoke<AgentDefinitionSummary[]>("list_codex_agents");
 }
 
 export async function readAgentFile(

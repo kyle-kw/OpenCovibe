@@ -61,6 +61,8 @@ export interface TaskRun {
   execution_path: ExecutionPath;
   /** Unified resume identity. Undefined = not resumable. */
   conversation_ref?: ConversationRef;
+  /** Codex CLI import: rollout files imported into this run. Used by sync to detect new rollouts. */
+  codex_imported_rollouts?: CodexImportedRollout[];
 }
 
 export interface ImportWatermark {
@@ -71,16 +73,24 @@ export interface ImportWatermark {
 }
 
 export interface CliSessionSummary {
+  /** "claude" or "codex" */
+  agent: string;
+  /** Claude session UUID or Codex thread_id */
   sessionId: string;
   cwd: string;
   firstPrompt: string;
   startedAt: string;
   lastActivityAt: string;
+  /** Claude: message count; Codex: completed turn count */
   messageCount: number;
   model?: string;
   cliVersion?: string;
+  /** Claude: file size; Codex: sum of all rollout sizes */
   fileSize: number;
+  /** Claude: JSONL path; Codex: latest rollout path */
   filePath: string;
+  /** Codex-only: list of all rollout files (asc by mtime). Empty/absent for Claude. */
+  rolloutPaths?: string[];
   hasSubagents: boolean;
   alreadyImported: boolean;
   existingRunId?: string;
@@ -103,8 +113,20 @@ export interface DiscoverResult {
 
 export interface SyncResult {
   newEvents: number;
-  newWatermark: ImportWatermark;
+  /** Claude-only: watermark for next incremental sync. Undefined for Codex. */
+  newWatermark?: ImportWatermark;
+  /** Codex-only: rollout files imported in this sync. Empty/absent for Claude. */
+  newRollouts?: string[];
   usageIncomplete: boolean;
+}
+
+/** Codex rollout file imported into a run. Codex-only. */
+export interface CodexImportedRollout {
+  path: string;
+  size: number;
+  /** Stringified nanoseconds since epoch (u128 unsafe for JS number). */
+  mtimeNs: string;
+  lastEventTs?: string;
 }
 
 export interface RunEvent {
@@ -143,6 +165,10 @@ export interface UserSettings {
   remote_hosts?: RemoteHost[];
   platform_credentials?: PlatformCredential[];
   active_platform_id?: string;
+  /** null clears it (serde → None); undefined when absent. */
+  codex_provider?: CodexProviderCredential | null;
+  /** Codex session transport: "app_server" (interactive tools) | "exec" (legacy, default). */
+  codex_transport?: string;
   ui_zoom?: number;
   onboarding_completed: boolean;
   web_server_enabled?: boolean;
@@ -182,7 +208,7 @@ export interface KeyBinding {
   key: string;
   context: "global" | "chat" | "prompt" | "cli";
   editable: boolean;
-  source: "app" | "cli";
+  source: "app" | "cli" | "codex";
   /** If true, this binding is also registered as an OS-level global shortcut. */
   osGlobal?: boolean;
 }
@@ -221,6 +247,7 @@ export interface HookEvent {
   model?: string;
   session_id?: string;
   worktree?: { name: string; path: string; branch: string; originalRepoDir: string };
+  /** Allow index access for dynamic field lookup (e.g. tool_use_id from hooks). */
   [key: string]: unknown;
 }
 
@@ -251,6 +278,17 @@ export interface AgentSettings {
   effort?: string;
   betas?: string[];
   agents_json?: string;
+  permission_mode?: string;
+  /** Codex `--ephemeral` — disable on-disk session persistence. */
+  ephemeral?: boolean;
+  /** Codex `--profile <name>` — select profile from ~/.codex/config.toml. */
+  profile?: string;
+  /** Codex `--ignore-user-config` — skip ~/.codex/config.toml. */
+  ignore_user_config?: boolean;
+  /** Codex `--ignore-rules` — skip execpolicy .rules files. */
+  ignore_rules?: boolean;
+  /** Codex `--search` — enable the native web_search tool (new sessions only). */
+  web_search?: boolean;
   updated_at: string;
 }
 
@@ -291,6 +329,7 @@ export interface CliCheckResult {
 export interface ProjectInitStatus {
   cwd: string;
   has_claude_md: boolean;
+  has_agents_md?: boolean;
 }
 
 export interface CliDistTags {
@@ -339,6 +378,7 @@ export interface RunUsageSummary {
   durationMs: number;
   numTurns: number;
   modelUsage?: Record<string, ModelUsageSummary>;
+  costEstimated?: boolean;
 }
 
 export interface ModelAggregate {
@@ -443,6 +483,13 @@ export interface CliInfo {
   fetched_at: string;
 }
 
+/** Codex model catalog fetched live from `codex app-server` (model/list). */
+export interface CodexModelList {
+  models: CliModelInfo[];
+  /** Model marked `isDefault` in the catalog, when present. */
+  defaultModel?: string;
+}
+
 // ── Per-model usage breakdown ──
 
 export interface ModelUsageEntry {
@@ -466,6 +513,14 @@ export interface McpServerInfo {
   error?: string;
 }
 
+export interface CodexAuthResult {
+  installed: boolean;
+  version?: string | null;
+  logged_in: boolean;
+  auth_method?: "chatgpt" | "api_key" | "unknown" | null;
+  status_text?: string | null;
+}
+
 // ── Diagnostics report (run_diagnostics command) ──
 
 export interface DiagnosticsReport {
@@ -475,6 +530,7 @@ export interface DiagnosticsReport {
   configs: ConfigDiagnostics;
   services: ServicesDiagnostics;
   system: SystemDiagnostics;
+  codex?: CodexAuthResult;
 }
 
 export interface CliDiagnostics {
@@ -501,10 +557,17 @@ export interface ProjectDiagnostics {
   cwd: string;
   has_claude_md: boolean;
   claude_md_files: ClaudeMdInfo[];
+  has_agents_md: boolean;
+  agents_md_files: AgentsMdInfo[];
   skipped_project_scope: boolean;
 }
 
 export interface ClaudeMdInfo {
+  path: string;
+  size_chars: number;
+}
+
+export interface AgentsMdInfo {
   path: string;
   size_chars: number;
 }
@@ -658,11 +721,21 @@ export interface MarketplaceInfo {
   plugin_count: number;
 }
 
+export type SkillSourceKind = "user" | "project-agents" | "project-codex" | "legacy" | "bundled";
+export type SkillDisabledBy = "path" | "name" | "bundled";
+
 export interface StandaloneSkill {
   name: string;
   description: string;
   path: string;
   scope?: string;
+  agent?: "claude" | "codex";
+  source_kind?: SkillSourceKind;
+  enabled?: boolean;
+  disabled_by?: SkillDisabledBy;
+  can_edit?: boolean;
+  can_delete?: boolean;
+  can_toggle?: boolean;
 }
 
 export interface InstalledPlugin {
@@ -673,6 +746,7 @@ export interface InstalledPlugin {
   enabled?: boolean;
   marketplace?: string;
   pluginId?: string;
+  agent?: "claude" | "codex";
   /** Project directory this plugin was installed in (project/local scope only). */
   projectPath?: string;
   [key: string]: unknown;
@@ -777,6 +851,7 @@ export interface ConfiguredMcpServer {
   url?: string;
   env_keys: string[];
   header_keys: string[];
+  agent?: "claude" | "codex";
 }
 
 // ── Sidebar panel types ──
@@ -887,7 +962,14 @@ export type BusEvent =
       /** Structured tool result metadata from CLI verbose mode */
       tool_use_result?: Record<string, unknown>;
     }
-  | { type: "user_message"; run_id: string; text: string; uuid?: string }
+  | {
+      type: "user_message";
+      run_id: string;
+      text: string;
+      uuid?: string;
+      client_uuid?: string;
+      attachments?: Array<{ name: string; mime_type: string; size: number }>;
+    }
   | { type: "run_state"; run_id: string; state: string; exit_code?: number; error?: string }
   | {
       type: "usage_update";
@@ -977,6 +1059,13 @@ export type BusEvent =
       parent_tool_use_id?: string;
     }
   | {
+      type: "tool_output_delta";
+      run_id: string;
+      tool_use_id: string;
+      delta: string;
+      parent_tool_use_id?: string;
+    }
+  | {
       type: "tool_use_summary";
       run_id: string;
       tool_use_id: string;
@@ -1028,13 +1117,57 @@ export type BusEvent =
       run_id: string;
       reason: RalphCompleteReason;
       iteration: number;
-    };
+    }
+  // Codex Wave-3: live goal progress from `thread/goal/updated`; goal is null
+  // when the objective was cleared (`thread/goal/cleared`).
+  | { type: "goal_update"; run_id: string; goal: ThreadGoal | null }
+  // Codex Wave-4: hook lifecycle. status is "running" on hook/started, then a terminal
+  // HookRunStatus ("completed"|"failed"|"blocked"|"stopped") on hook/completed. hook_id is
+  // stable across the pair so the reducer upserts one card. event_name is camelCase HookEventName.
+  | {
+      type: "codex_hook_run";
+      run_id: string;
+      hook_id: string;
+      event_name: string;
+      status: string;
+      status_message?: string;
+      duration_ms?: number;
+    }
+  // Codex Wave-4: live MCP server startup-state change (`mcpServer/startupStatus/updated`).
+  // status is the raw Codex McpServerStartupState ("starting"|"ready"|"failed"|"cancelled");
+  // the store reducer maps it to the panel vocab and upserts store.mcpServers by name.
+  | { type: "codex_mcp_status"; run_id: string; name: string; status: string; error?: string }
+  // Codex Wave-4: turn-level aggregated unified diff (`turn/diff/updated`). diff is cumulative
+  // across the turn; the store keeps the latest (cleared at the next turn). Not replayed.
+  | { type: "codex_turn_diff"; run_id: string; turn_id: string; diff: string };
 
 export type RalphCompleteReason =
   | "max_iterations"
   | "completion_promise"
   | "cancelled"
   | "fail_stopped";
+
+// ── Codex Wave-3: thread goal ──
+
+/** Goal status values from Codex `thread/goal/*`. */
+export type GoalStatus =
+  | "active"
+  | "paused"
+  | "blocked"
+  | "usageLimited"
+  | "budgetLimited"
+  | "complete";
+
+/** Snapshot of a Codex session objective + live progress. */
+export interface ThreadGoal {
+  objective?: string;
+  status?: GoalStatus;
+  tokenBudget?: number;
+  tokensUsed?: number;
+  timeUsedSeconds?: number;
+  createdAt?: string;
+  updatedAt?: string;
+}
 
 // ── MCP Elicitation types ──
 
@@ -1078,6 +1211,7 @@ export interface BusToolItem {
   suggestions?: PermissionSuggestion[];
   /** Structured tool result metadata from CLI verbose mode (e.g. file info for Read). */
   tool_use_result?: Record<string, unknown>;
+  /** Allow index access for dynamic field lookup (e.g. _inputJsonAccum, _seq). */
   [key: string]: unknown;
 }
 
@@ -1110,7 +1244,38 @@ export type TimelineEntry =
       subTimeline?: TimelineEntry[];
     }
   | { kind: "separator"; id: string; anchorId: string; content: string; ts: string }
-  | { kind: "command_output"; id: string; anchorId: string; content: string; ts: string };
+  | { kind: "command_output"; id: string; anchorId: string; content: string; ts: string }
+  // Codex Wave-4: a hook execution timeline entry. Upserted by the `codex_hook_run`
+  // reducer — keyed by `hookId` (= Codex run.id), stable across the started→completed
+  // pair so the running card updates in place instead of stacking a second entry.
+  | {
+      kind: "hook";
+      id: string;
+      anchorId: string;
+      hookId: string;
+      eventName: string;
+      status: string;
+      statusMessage?: string;
+      durationMs?: number;
+      ts: string;
+    };
+
+/** One row of a TodoWrite checklist (lives in a tool's `tool_use_result.newTodos`). */
+export interface TodoItem {
+  content: string;
+  status: "pending" | "in_progress" | "completed";
+  activeForm: string;
+}
+
+/**
+ * Unified task row for the TodoPanel, normalized from either source:
+ * the Tasks system (TaskCreate/TaskUpdate, aggregated) or legacy TodoWrite snapshots.
+ */
+export interface PanelTask {
+  id: string;
+  text: string;
+  status: "pending" | "in_progress" | "completed";
+}
 
 // ── App Updates ──
 
@@ -1198,6 +1363,11 @@ export interface CliConfigSettingDef {
   type: "boolean" | "enum" | "string";
   default: unknown;
   options?: { value: string; label: string }[];
+}
+
+export interface CodexConfigResult {
+  config: Record<string, unknown>;
+  warning?: string;
 }
 
 // ── Onboarding types ──
@@ -1375,6 +1545,18 @@ export interface PlatformCredential {
   extra_env?: Record<string, string>;
 }
 
+/** Codex third-party provider (OpenAI Responses API). Injected via `codex exec -c` + env_key,
+ *  not ANTHROPIC_* env. wire_api is always "responses". */
+export interface CodexProviderCredential {
+  id: string;
+  name: string;
+  base_url: string;
+  env_key: string;
+  wire_api: string;
+  model: string;
+  api_key?: string;
+}
+
 /** BTW side question streaming events (from Tauri) */
 export interface BtwDelta {
   btw_id: string;
@@ -1403,6 +1585,7 @@ export interface AgentDefinitionSummary {
   isolation?: string;
   readonly: boolean;
   raw_content?: string;
+  agent?: "claude" | "codex";
 }
 
 // ── Preview / Element Picker ──

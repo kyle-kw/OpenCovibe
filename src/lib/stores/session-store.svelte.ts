@@ -17,6 +17,8 @@ import type {
   McpServerInfo,
   ElicitationSchema,
   SessionMode,
+  TodoItem,
+  PanelTask,
 } from "$lib/types";
 import { dbg, dbgWarn } from "$lib/utils/debug";
 import { yieldToMain } from "$lib/utils/yield";
@@ -33,10 +35,18 @@ import {
 } from "./types";
 import { getEventMiddleware } from "./event-middleware";
 import { updateInstalledVersion, getCliCommands } from "./cli-info.svelte";
+import { getKnownVirtualNames } from "$lib/utils/slash-commands";
 import * as snapshotCache from "$lib/utils/snapshot-cache";
 import { getTransport } from "$lib/transport";
+import { getAgentCaps, type AgentCapabilities } from "$lib/utils/agent-caps";
 import { getAgentFeatures, type AgentFeatures } from "$lib/utils/agent-features";
 import { dedupeMcpServersByName } from "$lib/utils/mcp";
+import {
+  SCHEDULING_TOOLS,
+  pickSchedule,
+  pickCronId,
+  extractOutputText,
+} from "$lib/utils/tool-rendering";
 
 // ── CLI permission mode normalization ──
 // CLI may return different names for the same mode across versions.
@@ -47,6 +57,23 @@ const CLI_PERM_MODE_ALIASES: Record<string, string> = {
 
 function normalizePermissionMode(mode: string): string {
   return CLI_PERM_MODE_ALIASES[mode] ?? mode;
+}
+
+/** Extract `hookSpecificOutput.sessionTitle` from a SessionStart hook's raw stdout.
+ *  The CLI delivers the hook's stdout verbatim as a JSON string (verified over stream-json,
+ *  CLI 2.1.x). Returns the trimmed title, or null if absent/unparseable. */
+function extractSessionTitle(stdout: string | undefined): string | null {
+  if (!stdout) return null;
+  try {
+    const parsed = JSON.parse(stdout) as {
+      hookSpecificOutput?: { sessionTitle?: unknown };
+    };
+    const title = parsed.hookSpecificOutput?.sessionTitle;
+    if (typeof title === "string" && title.trim()) return title.trim();
+  } catch {
+    // Hook stdout is not always JSON (plain-text additionalContext etc.) — not an error.
+  }
+  return null;
 }
 
 // ── OpGuard: async operation guard with mounted check ──
@@ -116,7 +143,7 @@ interface ReduceCtx {
   seenMessageIds: Set<string>;
   seenToolIds: Set<string>;
   /** Track run.status changes from non-terminal run_state events (running/idle). */
-  runStatus: string | null;
+  runStatus: RunStatus | null;
   /** New session_id from session_init (e.g. fork generates a new CLI session). */
   sessionId: string | null;
   /** Whether this run uses stream-json mode (skip tools mirror writes). */
@@ -126,13 +153,12 @@ interface ReduceCtx {
   /** High-water context tokens / window since last compaction (drives contextUtilization). */
   contextHwTokens: number;
   contextHwWindow: number;
+  /** Context tokens of the last request in the current turn (drives context occupancy, #149). */
+  lastReqContextTokens: number;
   /** tool_use_id → tl[] index (only tool entries, first-match semantics). */
   toolTlIndex: Map<string, number>;
   /** tool_use_id → he[] index (only HookEvent entries with tool_use_id). */
   toolHeIndex: Map<string, number>;
-  /** tool_use_id → tool_start.input. Populated in tool_start branch so
-   *  tool_end branches in the same batch can join without waiting for commit. */
-  toolInputByUseId: Map<string, Record<string, unknown>>;
   /** Local scheduled-task accumulator. Snapshotted from store at ctx
    *  creation; only committed in _commitReduceCtx. Keeps async replay
    *  stale-safe (mid-batch abort doesn't pollute live store). */
@@ -148,6 +174,49 @@ function timelineAttachments(atts: Attachment[]): Attachment[] | undefined {
   return atts.map((a) =>
     (IMAGE_TYPES as readonly string[]).includes(a.type) ? a : { ...a, contentBase64: "" },
   );
+}
+
+/** Replay RunEvent[] into an xterm terminal.
+ *  Handles: user (prompt), system (status), stdout (agent output),
+ *  stderr (error stream), assistant (final reply). */
+function replayTerminalEvents(
+  events: import("$lib/types").RunEvent[],
+  xtermRef: { writeText(s: string): void },
+  isRunning: boolean,
+): void {
+  let hasHistory = false;
+  for (const event of events) {
+    const text = String(
+      (event.payload as Record<string, unknown>).text ??
+        (event.payload as Record<string, unknown>).message ??
+        "",
+    );
+    if (!text) continue;
+    switch (event.type) {
+      case "user":
+        xtermRef.writeText(`\x1b[1;36m> ${text}\x1b[0m\r\n`);
+        hasHistory = true;
+        break;
+      case "system":
+        xtermRef.writeText(`\x1b[90m${text}\x1b[0m\r\n`);
+        break;
+      case "stdout":
+        xtermRef.writeText(text);
+        hasHistory = true;
+        break;
+      case "stderr":
+        xtermRef.writeText(`\x1b[31m${text}\x1b[0m\r\n`);
+        hasHistory = true;
+        break;
+      case "assistant":
+        xtermRef.writeText(`${text}\r\n`);
+        hasHistory = true;
+        break;
+    }
+  }
+  if (hasHistory && !isRunning) {
+    xtermRef.writeText(`\r\n\x1b[90m--- Session ended ---\x1b[0m\r\n`);
+  }
 }
 
 /** Map frontend Attachment[] to backend AttachmentData format for IPC. */
@@ -258,6 +327,11 @@ export class SessionStore {
     reason: import("$lib/types").RalphCompleteReason | "interrupted" | null;
   } | null>(null);
 
+  /** Codex Wave-3 session goal. Populated by `getGoal` on panel open and
+   *  kept live by the `goal_update` reducer (from `thread/goal/updated`).
+   *  null = no objective set / non-Codex session. */
+  goal = $state<import("$lib/types").ThreadGoal | null>(null);
+
   /** Scheduled tasks created via CronCreate. Updated by tool_end reducer
    *  branches; replayed via snapshot. UI lives in ScheduledTasksChip.svelte. */
   scheduledTasks = $state<ScheduledTask[]>([]);
@@ -266,6 +340,9 @@ export class SessionStore {
   sessionCommands = $state<CliCommand[]>([]);
   /** MCP servers from session_init (per-session state). */
   mcpServers = $state<McpServerInfo[]>([]);
+  /** Codex Wave-4: latest cumulative turn diff (`turn/diff/updated`). Live-only,
+   *  not replayed — cleared at the start of each turn (run_state→running) and on reset. */
+  turnDiff = $state<string>("");
 
   // ── CLI verbose fields (from session_init / usage_update) ──
   cliVersion = $state<string>("");
@@ -322,6 +399,12 @@ export class SessionStore {
    *  window so a dip event without modelUsage doesn't zero the denominator. */
   contextHwTokens: number = $state(0);
   contextHwWindow: number = $state(0);
+  /** Context tokens of the LAST request in the current turn (input + cache_read +
+   *  cache_creation from the final assistant message_usage). Context occupancy is a
+   *  point-in-time measure, so it must use the last request — NOT the turn-summed
+   *  result usage, which multiplies cache_read by the request count (#149). 0 until
+   *  a message with usage arrives; the result handler falls back to summed usage then. */
+  lastReqContextTokens: number = $state(0);
   /** Timestamp of the most recent compact_boundary event (0 = never). */
   lastCompactedAt: number = $state(0);
   /** Number of full compaction events in this session. */
@@ -356,6 +439,10 @@ export class SessionStore {
   private _toolHeIndex = new Map<string, number>();
   /** _lastProcessedSeq at last snapshot write — throttles idle snapshot rewrites. */
   private _lastSnapshotSeq = 0;
+
+  /** Runtime state: whether the current run uses chat timeline (bus-events) rendering.
+   *  Only meaningful when `this.run` is set. Set by loadRun/startSession/resumeSession. */
+  _useChatTimelineForRun = $state(false);
 
   // Generation counter: prevents stale async loadRun from overwriting state
   private _loadGen = 0;
@@ -429,7 +516,10 @@ export class SessionStore {
         this.run?.id === runId &&
         this.phase === "running" &&
         !this.streamingText &&
-        !this.thinkingText
+        !this.thinkingText &&
+        // Don't flag an API hang while the turn is paused waiting on the user
+        // (approval card, elicitation, or a pending multiple-choice question).
+        !this._waitingOnUser
       ) {
         this._isTimeoutError = true;
         this.error = "No response after 60s — still waiting for API.";
@@ -459,7 +549,13 @@ export class SessionStore {
     const m = text.match(/^\/([a-z][\w-]*)(?:\s|$)/i);
     if (!m) return false;
     const name = m[1].toLowerCase();
-    // Check available skills (preloaded from filesystem, available before session_init)
+    // Use effective agent (run-level overrides store-level) — same as UI's effectiveAgent
+    const agent = this.run?.agent ?? this.agent;
+    // Codex: only non-excluded virtual commands (no skills, CLI, or project commands)
+    if (agent === "codex") {
+      return getKnownVirtualNames("codex").has(name);
+    }
+    // Claude: skills + session/CLI commands
     if (this.availableSkills.some((s) => s.toLowerCase() === name)) return true;
     // Check session commands (available after session_init) or static CLI info
     const cmds = this.sessionCommands.length > 0 ? this.sessionCommands : getCliCommands();
@@ -507,6 +603,73 @@ export class SessionStore {
     return this.tools.filter((e) => e.status === "running").at(-1)?.tool_name ?? "";
   }
 
+  /**
+   * The most recent TodoWrite checklist (top-level timeline only, matching the
+   * `/todos` command). Empty when no TodoWrite has run — including all Codex
+   * sessions, since Codex's exec protocol never emits TodoWrite.
+   */
+  get latestTodos(): TodoItem[] {
+    for (let i = this.timeline.length - 1; i >= 0; i--) {
+      const e = this.timeline[i];
+      if (
+        e.kind === "tool" &&
+        e.tool.tool_name === "TodoWrite" &&
+        e.tool.status === "success" &&
+        e.tool.tool_use_result != null &&
+        typeof e.tool.tool_use_result === "object" &&
+        Array.isArray((e.tool.tool_use_result as Record<string, unknown>).newTodos)
+      ) {
+        return (e.tool.tool_use_result as unknown as { newTodos: TodoItem[] }).newTodos;
+      }
+    }
+    return [];
+  }
+
+  /**
+   * Current task list aggregated from the Tasks system (TaskCreate/TaskUpdate),
+   * which is incremental — there is no single full-snapshot event. We replay the
+   * timeline in order: each TaskCreate adds a row (pending), each TaskUpdate mutates
+   * its status by taskId; a "deleted" status removes the row. Creation order is kept.
+   */
+  get taskList(): PanelTask[] {
+    const byId = new Map<string, PanelTask>();
+    const order: string[] = [];
+    for (const e of this.timeline) {
+      if (e.kind !== "tool" || e.tool.status !== "success") continue;
+      const r = e.tool.tool_use_result as Record<string, unknown> | undefined;
+      if (r == null || typeof r !== "object") continue;
+      if (e.tool.tool_name === "TaskCreate") {
+        const task = r.task as { id?: string; subject?: string } | undefined;
+        if (task?.id) {
+          if (!byId.has(task.id)) order.push(task.id);
+          byId.set(task.id, { id: task.id, text: task.subject ?? "", status: "pending" });
+        }
+      } else if (e.tool.tool_name === "TaskUpdate") {
+        const taskId = r.taskId as string | undefined;
+        const to = (r.statusChange as { to?: string } | undefined)?.to;
+        if (taskId && to && byId.has(taskId)) {
+          if (to === "deleted") byId.delete(taskId);
+          else byId.get(taskId)!.status = to as PanelTask["status"];
+        }
+      }
+    }
+    return order.map((id) => byId.get(id)).filter((t): t is PanelTask => t != null);
+  }
+
+  /**
+   * Unified source for the TodoPanel and /todos: prefer the Tasks system, fall back
+   * to legacy TodoWrite snapshots. Empty for Codex (neither tool exists there).
+   */
+  get panelTasks(): PanelTask[] {
+    const tasks = this.taskList;
+    if (tasks.length > 0) return tasks;
+    return this.latestTodos.map((td, i) => ({
+      id: String(i),
+      text: td.content,
+      status: td.status,
+    }));
+  }
+
   /** Recursive walk: short-circuit check for any permission_prompt in timeline + subTimelines. */
   private _hasPermission(predicate?: (t: BusToolItem) => boolean): boolean {
     function walk(entries: TimelineEntry[]): boolean {
@@ -533,6 +696,22 @@ export class SessionStore {
   /** Whether any MCP elicitation prompt is pending user response. */
   get hasElicitation(): boolean {
     return this.pendingElicitations.size > 0;
+  }
+
+  /** True when the turn is legitimately paused waiting on the user (permission approval,
+   *  MCP elicitation, or an AskUserQuestion/multiple-choice selection) rather than the API.
+   *  Used to suppress the "no response" timeout during these waits. */
+  private get _waitingOnUser(): boolean {
+    if (this.hasPendingPermission || this.hasElicitation) return true;
+    const walk = (entries: TimelineEntry[]): boolean => {
+      for (const e of entries) {
+        if (e.kind !== "tool") continue;
+        if (e.tool.status === "ask_pending") return true;
+        if (e.subTimeline && walk(e.subTimeline)) return true;
+      }
+      return false;
+    };
+    return walk(this.timeline);
   }
 
   /** Whether an inline-only permission (AskUserQuestion / ExitPlanMode) is pending. */
@@ -663,11 +842,27 @@ export class SessionStore {
     return this.run ? this.run.auth_mode === "api" : this.authMode === "api";
   }
 
+  get caps(): AgentCapabilities {
+    return getAgentCaps(this.agent);
+  }
+
   get useStreamSession(): boolean {
     // Run-level: check execution_path if run exists (resolved, non-undefined)
     if (this.run) return this.run.execution_path === "session_actor";
     // Pre-run: predict from agent (startSession decides which IPC to call)
     return this.agent === "claude";
+  }
+
+  /** Whether to use chat timeline rendering (bus-events) vs terminal.
+   *  Without a run: derives from agent caps. With a run: from runtime state.
+   *  useStreamSession always implies timeline (session_actor = bus events). */
+  get useChatTimeline(): boolean {
+    if (!this.run) {
+      // No run: infer from agent capabilities
+      return this.useStreamSession || this.caps.supportsBusEvents;
+    }
+    // session_actor always uses timeline; for pipe_exec, check runtime flag
+    return this.useStreamSession || this._useChatTimelineForRun;
   }
 
   /** Per-agent UI feature flags. */
@@ -721,7 +916,7 @@ export class SessionStore {
   }
 
   /** Push an optimistic user message to the timeline (deduped by content in _reduce). */
-  private _pushOptimisticUser(content: string, attachments?: Attachment[]): void {
+  private _pushOptimisticUser(content: string, attachments?: Attachment[]): string {
     const id = uuid();
     this._pushTimeline(null, {
       kind: "user",
@@ -733,6 +928,7 @@ export class SessionStore {
         ? { attachments: timelineAttachments(attachments) }
         : {}),
     });
+    return id;
   }
 
   /** Append a hook event entry and update tool index if applicable.
@@ -818,16 +1014,13 @@ export class SessionStore {
   }
 
   /** Lookup the tool_start input for a given tool_use_id. Used by tool_end
-   *  branches (e.g. CronCreate) to join with the originating input.
-   *  Order: ctx batch map → ctx.tl → live timeline (covers live applyEvent path). */
+   *  branches (e.g. CronCreate) to join with the originating input. Reads from
+   *  the timeline — same-batch tool_start is committed by _pushTimeline before
+   *  tool_end runs. */
   private _lookupToolStartInput(
     ctx: ReduceCtx | null,
     toolUseId: string,
   ): Record<string, unknown> | undefined {
-    if (ctx) {
-      const fromMap = ctx.toolInputByUseId.get(toolUseId);
-      if (fromMap) return fromMap;
-    }
     const tl = ctx?.tl ?? this.timeline;
     const idx = this._findToolIdx(ctx, toolUseId);
     if (idx >= 0) {
@@ -1103,13 +1296,13 @@ export class SessionStore {
       seenToolIds: new Set(this._seenToolIds),
       runStatus: null,
       sessionId: null,
-      isStream: this.useStreamSession,
+      isStream: this.useChatTimeline,
       turnUsages: [...this.turnUsages],
       contextHwTokens: this.contextHwTokens,
       contextHwWindow: this.contextHwWindow,
+      lastReqContextTokens: this.lastReqContextTokens,
       toolTlIndex: batchTlIndex,
       toolHeIndex: batchHeIndex,
-      toolInputByUseId: new Map<string, Record<string, unknown>>(),
       scheduledTasks: [...this.scheduledTasks],
     };
   }
@@ -1154,6 +1347,7 @@ export class SessionStore {
     this.turnUsages = ctx.turnUsages;
     this.contextHwTokens = ctx.contextHwTokens;
     this.contextHwWindow = ctx.contextHwWindow;
+    this.lastReqContextTokens = ctx.lastReqContextTokens;
     this._seenMessageIds = ctx.seenMessageIds;
     this._seenToolIds = ctx.seenToolIds;
     this._toolTlIndex = ctx.toolTlIndex;
@@ -1313,6 +1507,7 @@ export class SessionStore {
 
   /** Clear all content/display state fields. Does not touch phase, run, or agent. */
   private _clearContentState(): void {
+    this._useChatTimelineForRun = false;
     this.timeline = [];
     this.streamingText = "";
     this.thinkingText = "";
@@ -1336,9 +1531,11 @@ export class SessionStore {
     this.pendingElicitations = new Map();
     this.persistedFiles = [];
     this.ralphLoop = null;
+    this.goal = null;
     this.scheduledTasks = [];
     this.sessionCommands = [];
     this.mcpServers = [];
+    this.turnDiff = "";
     this.cliVersion = "";
     // NOTE: permissionMode intentionally NOT cleared — user-level preference, same as platformId.
     // However, if persist had failed, reset the flag so next session_init can re-sync.
@@ -1361,6 +1558,7 @@ export class SessionStore {
     this.turnUsages = [];
     this.contextHwTokens = 0;
     this.contextHwWindow = 0;
+    this.lastReqContextTokens = 0;
     this.lastCompactedAt = 0;
     this.compactCount = 0;
     this.microcompactCount = 0;
@@ -1408,6 +1606,41 @@ export class SessionStore {
     this._clearContentState();
   }
 
+  /**
+   * Codex turn-based rewind: drop the timeline tail starting at the
+   * `dropFromTurnIndex`-th top-level user message (0-based). Keeps turns
+   * [0, dropFromTurnIndex) and removes everything from that user message
+   * onward. Mirrors a successful `thread/rollback` on the backend — history
+   * only; file changes are NOT reverted (caller surfaces that warning).
+   *
+   * Returns the number of turns dropped (0 if the index is out of range).
+   */
+  truncateToTurn(dropFromTurnIndex: number): number {
+    if (dropFromTurnIndex < 0) return 0;
+    let userSeen = 0;
+    let cutAt = -1;
+    for (let i = 0; i < this.timeline.length; i++) {
+      if (this.timeline[i].kind === "user") {
+        if (userSeen === dropFromTurnIndex) {
+          cutAt = i;
+          break;
+        }
+        userSeen++;
+      }
+    }
+    if (cutAt < 0) return 0; // index past the last turn — nothing to drop
+    const droppedTurns = this.timeline.slice(cutAt).filter((e) => e.kind === "user").length;
+    this.timeline = this.timeline.slice(0, cutAt);
+    // Rebuild numTurns from surviving user messages so the status bar/turn list agree.
+    this.numTurns = this.timeline.filter((e) => e.kind === "user").length;
+    this.turnUsages = this.turnUsages.slice(0, dropFromTurnIndex);
+    // Streaming/thinking buffers belong to the (now-removed) latest turn.
+    this.streamingText = "";
+    this.thinkingText = "";
+    dbg("store", "truncateToTurn", { dropFromTurnIndex, droppedTurns, kept: this.numTurns });
+    return droppedTurns;
+  }
+
   // ── Snapshot cache helpers ──
 
   /** Serialize current store state into a JSON string for IDB caching. */
@@ -1424,6 +1657,7 @@ export class SessionStore {
       turnUsages: this.turnUsages,
       contextHwTokens: this.contextHwTokens,
       contextHwWindow: this.contextHwWindow,
+      lastReqContextTokens: this.lastReqContextTokens,
       _seenMessageIds: [...this._seenMessageIds],
       _seenToolIds: [...this._seenToolIds],
       // B group (direct fields)
@@ -1504,6 +1738,7 @@ export class SessionStore {
       this.turnUsages = (obj.turnUsages ?? []) as TurnUsage[];
       this.contextHwTokens = (obj.contextHwTokens as number) ?? 0;
       this.contextHwWindow = (obj.contextHwWindow as number) ?? 0;
+      this.lastReqContextTokens = (obj.lastReqContextTokens as number) ?? 0;
       this._seenMessageIds = new Set((obj._seenMessageIds ?? []) as string[]);
       this._seenToolIds = new Set((obj._seenToolIds ?? []) as string[]);
 
@@ -1543,13 +1778,17 @@ export class SessionStore {
         (obj.taskNotifications ?? []) as Array<[string, TaskNotificationItem]>,
       );
       this.scheduledTasks = Array.isArray(obj.scheduledTasks)
-        ? (obj.scheduledTasks as unknown[]).filter(
-            (t): t is ScheduledTask =>
-              !!t &&
-              typeof t === "object" &&
-              typeof (t as Record<string, unknown>).id === "string" &&
-              typeof (t as Record<string, unknown>).humanSchedule === "string",
-          )
+        ? (obj.scheduledTasks as unknown[]).filter((t): t is ScheduledTask => {
+            if (!t || typeof t !== "object") return false;
+            const o = t as Record<string, unknown>;
+            return (
+              typeof o.id === "string" &&
+              typeof o.humanSchedule === "string" &&
+              typeof o.recurring === "boolean" &&
+              typeof o.durable === "boolean" &&
+              typeof o.toolUseId === "string"
+            );
+          })
         : [];
       this._lastProcessedSeq = (obj._lastProcessedSeq as number) ?? 0;
 
@@ -1670,6 +1909,12 @@ export class SessionStore {
       // overwrite the phase we just set from run.status. Same pattern as resumeSession.
       const isTerminal = TERMINAL_PHASES.includes(this.phase);
 
+      // Pre-set _useChatTimelineForRun: session_actor always; pipe_exec only if
+      // active Phase 2 (has conversation_ref). Overridden by bus-events branch below.
+      this._useChatTimelineForRun =
+        this.run!.execution_path === "session_actor" ||
+        (this.run!.execution_path === "pipe_exec" && !isTerminal && !!this.run!.conversation_ref);
+
       if (this.useStreamSession) {
         let reducerMs = 0;
         let snapshotHit = false;
@@ -1772,6 +2017,42 @@ export class SessionStore {
           reducer: Math.round(reducerMs),
           entries: this.timeline.length,
         });
+      } else if (this.caps.supportsBusEvents) {
+        // Codex bus-events path: try bus-events, fall back to terminal
+        const busEvents = await api.getBusEvents(id);
+        if (gen !== this._loadGen) {
+          dbg("store", "stale after getBusEvents (codex), gen=", gen);
+          return;
+        }
+        let reducerMs = 0;
+        if (busEvents.length > 0) {
+          this._useChatTimelineForRun = true;
+          // Always replayOnly for loadRun — these are persisted historical events.
+          // Live events arrive via WS subscription (set up below).
+          reducerMs = this.applyEventBatch(busEvents, { replayOnly: true });
+        } else if (!isTerminal && this.run?.conversation_ref?.kind === "codex_thread") {
+          // Active Phase 2 run with no bus-events yet (just started) → timeline, wait for real-time
+          this._useChatTimelineForRun = true;
+        } else {
+          // Terminal run with no bus-events OR active Phase 1 run (no conversation_ref) → terminal
+          this._useChatTimelineForRun = false;
+          // Replay terminal history (same as legacy branch below)
+          if (xtermRef) {
+            const termEvents = await api.getRunEvents(id);
+            if (gen !== this._loadGen) return;
+            replayTerminalEvents(termEvents, xtermRef, this.isRunning);
+          }
+        }
+        // Non-terminal Phase 2 runs must subscribe regardless of history
+        if (!isTerminal && this._useChatTimelineForRun) {
+          this._wsSubscribeAfterLoad(id, busEvents);
+        }
+        this._isLoadingReplay = false;
+        dbg("store", "loadRun (codex bus)", {
+          events: busEvents.length,
+          reducer: Math.round(reducerMs),
+          timeline: this._useChatTimelineForRun,
+        });
       } else {
         this._isLoadingReplay = false;
         // CLI mode: replay history in terminal
@@ -1780,23 +2061,8 @@ export class SessionStore {
           dbg("store", "stale after getRunEvents, gen=", gen);
           return;
         }
-        let hasHistory = false;
-        for (const event of events) {
-          const text = String(
-            (event.payload as Record<string, unknown>).text ??
-              (event.payload as Record<string, unknown>).message ??
-              "",
-          );
-          if (!text || !xtermRef) continue;
-          if (event.type === "user") {
-            xtermRef.writeText(`\x1b[1;36m> ${text}\x1b[0m\r\n`);
-            hasHistory = true;
-          } else if (event.type === "system") {
-            xtermRef.writeText(`\x1b[90m${text}\x1b[0m\r\n`);
-          }
-        }
-        if (hasHistory && !this.isRunning && xtermRef) {
-          xtermRef.writeText(`\r\n\x1b[90m--- Session ended ---\x1b[0m\r\n`);
+        if (xtermRef) {
+          replayTerminalEvents(events, xtermRef, this.isRunning);
         }
       }
 
@@ -1814,7 +2080,8 @@ export class SessionStore {
       }
 
       // Restore per-run model from meta.json (overrides session_init if user hot-switched)
-      if (this.run?.model) {
+      // Skip for Codex — its run.model may be polluted with Claude model names
+      if (this.run?.model && this.agent !== "codex") {
         dbg("store", "restore run model from meta:", this.run.model);
         this.model = this.run.model;
       }
@@ -1871,29 +2138,54 @@ export class SessionStore {
             this.permissionMode = permissionModeOverride;
             this.permissionModeSetByUser = true;
           }
-        } else if (freshSettings.permission_mode) {
-          const freshPerm =
-            APP_TO_CLI[freshSettings.permission_mode] ?? freshSettings.permission_mode;
-          if (freshPerm !== this.permissionMode) {
-            dbg("store", "startSession: refreshing permissionMode", {
-              old: this.permissionMode,
-              new: freshPerm,
-            });
-            this.permissionMode = freshPerm;
-            this.permissionModeSetByUser = true;
+        } else if (!this.permissionModeSetByUser) {
+          // Refresh permissionMode: agentSettings.plan_mode takes priority (consistent
+          // with backend adapter.rs:102). Don't set permissionModeSetByUser — that flag
+          // is only for user manual changes; session_init is the authority.
+          let agentPlanMode = false;
+          try {
+            const as = await api.getAgentSettings(this.agent);
+            agentPlanMode = !!as?.plan_mode;
+          } catch {
+            /* non-fatal */
+          }
+
+          if (agentPlanMode) {
+            if (this.permissionMode !== "plan") {
+              dbg("store", "startSession: agentSettings.plan_mode → plan", {
+                old: this.permissionMode,
+              });
+              this.permissionMode = "plan";
+            }
+          } else if (freshSettings.permission_mode) {
+            const freshPerm =
+              APP_TO_CLI[freshSettings.permission_mode] ?? freshSettings.permission_mode;
+            if (freshPerm !== this.permissionMode) {
+              dbg("store", "startSession: refreshing permissionMode", {
+                old: this.permissionMode,
+                new: freshPerm,
+              });
+              this.permissionMode = freshPerm;
+            }
           }
         }
       } catch {
         // Non-fatal: fall through with current store values
       }
 
-      // Explicitly pass execution_path — source of truth for run mode
-      const executionPath = this.useStreamSession ? "session_actor" : "pipe_exec";
+      // Explicitly pass execution_path for Claude (source of truth for run mode).
+      // For Codex, defer to the backend: it picks session_actor (app-server transport) vs
+      // pipe_exec (legacy) from the `codex_transport` user setting. Forcing it here would
+      // override that and pin Codex to exec.
+      const executionPath =
+        this.agent === "codex" ? undefined : this.useStreamSession ? "session_actor" : "pipe_exec";
+      // Only pass model for stream-session (Claude); pipe-exec (Codex) doesn't use it
+      const runModel = this.useStreamSession ? this.model || undefined : undefined;
       const run = await api.startRun(
         prompt,
         cwd,
         this.agent,
-        this.model || undefined,
+        runModel,
         this.remoteHostName || undefined,
         this.platformId || undefined,
         executionPath,
@@ -1901,6 +2193,7 @@ export class SessionStore {
       this.run = run;
 
       if (this.useStreamSession) {
+        this._useChatTimelineForRun = true;
         // Optimistic user message — the backend emits UserMessage during
         // api.startSession(), but the middleware subscription isn't set up
         // until after goto() triggers the URL $effect.  Content-based dedup
@@ -1930,6 +2223,22 @@ export class SessionStore {
         } else {
           this._startResponseTimeout(run.id);
         }
+      } else if (this.caps.supportsBusEvents) {
+        // Codex bus-events pipe mode (Phase 2)
+        this._useChatTimelineForRun = true;
+        const clientUuid = this._pushOptimisticUser(prompt, attachments);
+        const mw = getEventMiddleware();
+        mw.subscribeCurrent(run.id, this);
+        this._wsSubscribeNewSession(run.id);
+        this._setPhase("running");
+        // Don't pass model for Codex — it doesn't use Claude model names
+        await api.sendChatMessage(
+          run.id,
+          prompt,
+          attachments.length > 0 ? attachments : undefined,
+          undefined,
+          clientUuid,
+        );
       } else {
         // PipeExec path (Codex): useStreamSession is false iff the freshly
         // created run has execution_path=pipe_exec, so sendChatMessage is the
@@ -1947,32 +2256,106 @@ export class SessionStore {
   }
 
   /** Send a subsequent message in an active session. */
-  async sendMessage(text: string, attachments: Attachment[]): Promise<void> {
+  async sendMessage(
+    text: string,
+    attachments: Attachment[],
+    // Structured Codex skill refs picked in the composer. Threaded to api.sendSessionMessage so
+    // the agent triggers the skill via a {type:"skill"} UserInput item. Live-Codex only (the
+    // picker is gated to that); empty/undefined = unchanged behavior for Claude and no-skill sends.
+    skills?: { name: string; path: string }[],
+  ): Promise<void> {
     if (!this.run) return;
     this.error = "";
     // Invalidate idle snapshot — user is sending a new message
     snapshotCache.deleteSnapshot(this.run.id).catch(() => {});
 
+    const hasSkills = !!skills && skills.length > 0;
+
     try {
-      if (this.useStreamSession) {
-        // SessionActor (Claude stream-json): requires a live CLI process.
-        // Why-not fallback: sendChatMessage targets pipe_exec runs only; the
-        // backend rejects it for session_actor runs (commands/chat.rs). When
-        // the process has died, surface a clear error instead of routing to
-        // an IPC that is guaranteed to fail.
-        if (!this.sessionAlive) {
-          throw new Error("Session ended — start a new session to continue.");
-        }
+      if (
+        this.useStreamSession &&
+        this.sessionAlive &&
+        this.run.agent === "codex" &&
+        this.isRunning &&
+        attachments.length === 0 &&
+        // Skills must ride on turn/start (the {type:"skill"} UserInput item) — turn/steer takes
+        // plain text only, so a skill-bearing send falls through to the enqueue path below.
+        !hasSkills
+      ) {
+        // Mid-turn steer (Codex app-server): a turn is RUNNING and the user sends from the
+        // mid-turn send button. Inject the text into the CURRENT turn via turn/steer instead
+        // of enqueueing a new turn. (turn/steer takes plain text input — attachments fall
+        // through to the normal enqueue path below.) The steered text still shows as a user
+        // entry via the optimistic push; the backend does not echo a separate UserMessage.
+        this._pushOptimisticUser(text, attachments);
+        await api.steerSession(this.run.id, text);
+        dbg("store", "codex mid-turn steer", { len: text.length });
+      } else if (this.useStreamSession && this.sessionAlive) {
         // Optimistic user message — matches the pattern in startSession().
         // Content-based dedup in _reduce(user_message) prevents double display
         // when the backend's UserMessage bus event arrives.
         this._pushOptimisticUser(text, attachments);
-        await api.sendSessionMessage(this.run.id, text, mapAttachments(attachments) ?? undefined);
+        await api.sendSessionMessage(
+          this.run.id,
+          text,
+          mapAttachments(attachments) ?? undefined,
+          hasSkills ? skills : undefined,
+        );
+        if (hasSkills) dbg("skills", "store send with skills", { count: skills!.length });
         if (this.isKnownSlashCommand(text)) {
           dbg("store", "skip response timeout for slash command", { cmd: text.split(" ")[0] });
         } else {
           this._startResponseTimeout(this.run.id);
         }
+      } else if (this.useStreamSession && this.run.agent === "codex") {
+        // Stopped Codex app-server session (user clicked Stop, then sent a new message):
+        // re-spawn the actor with THIS message via start_session. The backend resumes the
+        // thread from conversation_ref (thread/resume) and sends this message as the turn.
+        // (Without this branch it falls through to send_chat_message and the backend rejects
+        // it: "requires execution_path=pipe_exec, got SessionActor". Claude stopped runs are
+        // resumed via resumeSession elsewhere, so this is scoped to Codex.)
+        this._useChatTimelineForRun = true;
+        this._pushOptimisticUser(text, attachments);
+        if (this.run) this.run = { ...this.run, status: "running" };
+        const mw = getEventMiddleware();
+        mw.subscribeCurrent(this.run!.id, this);
+        this._wsSubscribeNewSession(this.run!.id);
+        await api.startSession(
+          this.run!.id,
+          undefined,
+          undefined,
+          text,
+          mapAttachments(attachments) ?? undefined,
+          this.platformId || undefined,
+        );
+        this._startSpawnTimeout(this.run!.id);
+      } else if (
+        !this.useStreamSession &&
+        this.caps.supportsBusEvents &&
+        this.run?.conversation_ref?.kind === "codex_thread"
+      ) {
+        // Codex bus-events resume path: stopped run with codex_thread → auto resume
+        if (!this._useChatTimelineForRun) {
+          this._useChatTimelineForRun = true;
+          const mw = getEventMiddleware();
+          mw.subscribeCurrent(this.run!.id, this);
+          this._wsSubscribeNewSession(this.run!.id);
+        }
+        const clientUuid = this._pushOptimisticUser(text, attachments);
+        this._setPhase("running");
+        await api.sendChatMessage(
+          this.run!.id,
+          text,
+          attachments.length > 0 ? attachments : undefined,
+          undefined,
+          clientUuid,
+        );
+      } else if (this.useStreamSession) {
+        // Dead session_actor that's NOT a resumable Codex run (e.g. a stopped Claude
+        // process): routing to sendChatMessage would be rejected (pipe_exec only), so
+        // surface a clear error instead of a guaranteed-to-fail IPC. Codex stop→resend
+        // is handled by the codex re-spawn branch above. (master: clear-error fallback)
+        throw new Error("Session ended — start a new session to continue.");
       } else {
         // PipeExec (Codex): one-shot process per message, no liveness concept.
         this._setPhase("running");
@@ -2138,6 +2521,7 @@ export class SessionStore {
       this.agent = run.agent;
       this.platformId = run.platform_id ?? null;
       this._clearContentState();
+      this._useChatTimelineForRun = true; // resumeSession is always Claude stream path
 
       // ★ Phase 3: apply snapshot or events + force invalidate
       let reducerMs = 0;
@@ -2176,7 +2560,8 @@ export class SessionStore {
       });
 
       // Restore per-run model from meta.json (overrides session_init if user hot-switched)
-      if (run.model) {
+      // Skip for Codex — its run.model may be polluted with Claude model names
+      if (run.model && this.agent !== "codex") {
         dbg("store", "resume: restore run model from meta:", run.model);
         this.model = run.model;
       }
@@ -2268,6 +2653,7 @@ export class SessionStore {
     // Without this, the source session's timeline stays in state and
     // message_delta events accumulate as duplicate streamingText.
     this._clearContentState();
+    this._useChatTimelineForRun = true;
 
     // Replay copied parent events for immediate display.
     // Subscribe to live events AFTER replay so a live applyEvent during chunked
@@ -2356,14 +2742,23 @@ export class SessionStore {
     this.mcpServers = dedupeMcpServersByName(servers);
   }
 
-  /** Resolve an AskUserQuestion tool: transition from ask_pending → success. */
-  resolveAskQuestion(toolUseId: string, answer: string): void {
+  /** Resolve an AskUserQuestion tool: transition from ask_pending → success.
+   *  `answersMap` (question-text → selected label) is stored on tool_use_result so the
+   *  resolved card highlights each question's choice (needed for multi-question). */
+  resolveAskQuestion(toolUseId: string, answer: string, answersMap?: Record<string, string>): void {
     dbg("store", "resolveAskQuestion", { toolUseId, answer });
     const tIdx = this._findToolIdx(null, toolUseId);
     if (tIdx >= 0) {
       const old = this.timeline[tIdx] as Extract<TimelineEntry, { kind: "tool" }>;
       const u = [...this.timeline];
-      u[tIdx] = { ...old, tool: { ...old.tool, status: "success", output: { answer } } };
+      const tool = { ...old.tool, status: "success" as const, output: { answer } };
+      if (answersMap) {
+        tool.tool_use_result = {
+          ...(old.tool.tool_use_result as Record<string, unknown> | undefined),
+          answers: answersMap,
+        };
+      }
+      u[tIdx] = { ...old, tool };
       this.timeline = u;
     }
     // Mirror to tools[] only in non-stream mode
@@ -2377,17 +2772,60 @@ export class SessionStore {
     }
   }
 
-  /** Answer an AskUserQuestion tool via session message. */
+  /** Answer an AskUserQuestion tool.
+   *  - Codex (app-server): the tool_use_id IS the pending request id → reply via the
+   *    JSON-RPC `respond_user_input` channel (NOT a new user turn).
+   *  - Claude: send the answer as a follow-up user message. */
   async answerToolQuestion(toolUseId: string, answer: string): Promise<void> {
     if (!this.run) return;
     dbg("store", "tool answer", { toolUseId, answer });
-    // Transition UI immediately
-    this.resolveAskQuestion(toolUseId, answer);
+
+    // Multi-question answers arrive JSON-encoded from InlineToolCard (submitAllAskAnswers):
+    // { __askMulti: true, byId: {qid: label}, byText: {questionText: label} }.
+    let multi: { byId: Record<string, string>; byText: Record<string, string> } | null = null;
+    try {
+      const p = JSON.parse(answer);
+      if (p && p.__askMulti) multi = { byId: p.byId ?? {}, byText: p.byText ?? {} };
+    } catch {
+      /* plain single answer */
+    }
+
+    // Capture the question id before resolving (resolveAskQuestion overwrites output).
+    const tIdx = this._findToolIdx(null, toolUseId);
+    const tool = tIdx >= 0 ? (this.timeline[tIdx] as { tool?: BusToolItem }).tool : undefined;
+
+    // Display summary: readable for multi-question, raw for single.
+    const display = multi
+      ? Object.entries(multi.byText)
+          .map(([q, a]) => `${q}: ${a}`)
+          .join("\n")
+      : answer;
+    // Pass the per-question answers so the resolved card highlights each choice.
+    this.resolveAskQuestion(toolUseId, display, multi ? multi.byText : undefined);
+
+    if (this.run.agent === "codex") {
+      try {
+        const answers: Record<string, string[]> = {};
+        if (multi && Object.keys(multi.byId).length > 0) {
+          for (const [qid, label] of Object.entries(multi.byId)) answers[qid] = [label];
+        } else {
+          const questions = (tool?.input?.questions ?? []) as Array<{ id?: string }>;
+          answers[questions[0]?.id ?? "0"] = [answer];
+        }
+        await api.respondUserInput(this.run.id, toolUseId, answers);
+      } catch (e) {
+        dbgWarn("store", "codex respondUserInput failed:", e);
+        this.error = String(e);
+        throw e;
+      }
+      return;
+    }
+
     try {
       // Send the user's answer as a follow-up message.
       // The session should be alive (idle phase) after the CLI auto-failed AskUserQuestion.
       if (this.sessionAlive) {
-        await api.sendSessionMessage(this.run.id, answer);
+        await api.sendSessionMessage(this.run.id, display);
       } else {
         dbgWarn("store", "session not alive for tool answer, skipping send");
       }
@@ -2455,6 +2893,8 @@ export class SessionStore {
   /** Handle chat-done event (pipe mode). */
   handleChatDone(_done: { ok: boolean; code: number; error?: string }): void {
     if (!this.run) return;
+    // When useChatTimeline is true, RunState bus event handles phase transition
+    if (this.useChatTimeline) return;
 
     if (!this.useStreamSession) {
       this._setPhase("completed");
@@ -2470,6 +2910,8 @@ export class SessionStore {
   /** Handle chat-delta event (pipe-exec mode). */
   handleChatDelta(text: string, xtermRef?: { writeText(s: string): void }): void {
     if (!this.run) return;
+    // When useChatTimeline is true, bus events handle text rendering
+    if (this.useChatTimeline) return;
     if (!this.useStreamSession && xtermRef) {
       xtermRef.writeText(text);
     }
@@ -2479,7 +2921,7 @@ export class SessionStore {
 
   /** Whether to skip tools (HookEvent[]) mirror writes. Stream mode tools are in timeline only. */
   private _isStreamMode(ctx: ReduceCtx | null): boolean {
-    return ctx ? ctx.isStream : this.useStreamSession;
+    return ctx ? ctx.isStream : this.useChatTimeline;
   }
 
   /**
@@ -2790,6 +3232,24 @@ export class SessionStore {
             len: savedThinking.length,
           });
 
+        // Track this request's context size (input + cache_read + cache_creation). Context
+        // occupancy is point-in-time, so the result handler uses the LAST request's value
+        // instead of the turn-summed result usage, which multiplies cache_read by request
+        // count (#149). Main-session messages only — subagent usage is its own context.
+        if (ev.message_usage) {
+          const mu = ev.message_usage;
+          const num = (k: string) => (typeof mu[k] === "number" ? (mu[k] as number) : 0);
+          const reqCtx =
+            num("input_tokens") +
+            num("cache_read_input_tokens") +
+            num("cache_creation_input_tokens");
+          if (reqCtx > 0) {
+            if (ctx) ctx.lastReqContextTokens = reqCtx;
+            else this.lastReqContextTokens = reqCtx;
+            dbg("store", "lastReqContextTokens", { reqCtx });
+          }
+        }
+
         this._pushTimeline(ctx, entry);
         break;
       }
@@ -2801,14 +3261,15 @@ export class SessionStore {
         // (replayOnly=true), every event from events.jsonl is authoritative —
         // the user may legitimately send the same text twice in different turns.
         if (!replayOnly) {
-          // Find the most recent user entry with matching text that hasn't been UUID-confirmed yet.
-          // Using backward search (findLast) avoids matching old replayed entries from before
-          // Phase 1 (which also lack cliUuid). For rapid-fire identical messages, UUID assignment
-          // order is reversed (LIFO), but this is functionally correct — each entry still gets a
-          // unique UUID for checkpoint identification.
-          const match = tl.findLast(
-            (e) => e.kind === "user" && e.content === ev.text && !e.cliUuid,
-          );
+          let match: TimelineEntry | undefined;
+          // Priority 1: exact match by client_uuid (Codex pipe path)
+          if (ev.client_uuid) {
+            match = tl.findLast((e) => e.kind === "user" && e.id === ev.client_uuid);
+          }
+          // Priority 2: content-based match (Claude path / legacy compat)
+          if (!match) {
+            match = tl.findLast((e) => e.kind === "user" && e.content === ev.text && !e.cliUuid);
+          }
           if (match && match.kind === "user") {
             // Merge cliUuid + anchorId from the confirmed backend event into the optimistic entry
             if (ev.uuid) {
@@ -2825,6 +3286,16 @@ export class SessionStore {
           }
         }
         const newId = uuid();
+        // Convert bus-event attachments (name/mime_type/size) to timeline Attachment shape
+        const busAttachments: Attachment[] | undefined =
+          ev.attachments && ev.attachments.length > 0
+            ? ev.attachments.map((a: { name: string; mime_type: string; size: number }) => ({
+                name: a.name,
+                type: a.mime_type,
+                size: a.size,
+                contentBase64: "",
+              }))
+            : undefined;
         const entry: TimelineEntry = {
           kind: "user",
           id: newId,
@@ -2832,6 +3303,7 @@ export class SessionStore {
           content: ev.text,
           ts: eventTs(ev),
           ...(ev.uuid ? { cliUuid: ev.uuid } : {}),
+          ...(busAttachments ? { attachments: busAttachments } : {}),
         };
         this._pushTimeline(ctx, entry);
 
@@ -2881,12 +3353,6 @@ export class SessionStore {
         this._clearTimeoutError();
         if (getSeenTool().has(ev.tool_use_id)) break;
         getSeenTool().add(ev.tool_use_id);
-        // Stash input so tool_end branches can join by tool_use_id.
-        // Batch path uses ctx map; live path falls back to timeline lookup
-        // in `_lookupToolStartInput` (entry written by _pushTimeline below).
-        if (ctx && ev.input && typeof ev.input === "object") {
-          ctx.toolInputByUseId.set(ev.tool_use_id, ev.input as Record<string, unknown>);
-        }
         // Subagent routing: nest inside parent tool's subTimeline
         if (ev.parent_tool_use_id) {
           const parentIdx = this._findParentToolIdx(ctx, ev.parent_tool_use_id);
@@ -3005,11 +3471,8 @@ export class SessionStore {
           }
         }
 
-        // Scheduled-task tracking: CronCreate / CronDelete maintain scheduledTasks state.
-        // Writes go through ctx.scheduledTasks (batch path) or this.scheduledTasks
-        // (live applyEvent path with ctx=null) to keep async-replay stale-safety.
         // CronList is intentionally not consumed — output shape is unverified upstream.
-        if (resolvedStatus === "success") {
+        if (resolvedStatus === "success" && SCHEDULING_TOOLS.has(ev.tool_name)) {
           const readTasks = (): ScheduledTask[] => (ctx ? ctx.scheduledTasks : this.scheduledTasks);
           const writeTasks = (next: ScheduledTask[]): void => {
             if (ctx) ctx.scheduledTasks = next;
@@ -3029,14 +3492,7 @@ export class SessionStore {
                 recurring: result.recurring === true,
                 durable: result.durable === true,
                 prompt: typeof startInput?.prompt === "string" ? startInput.prompt : undefined,
-                cron:
-                  typeof startInput?.cron === "string"
-                    ? startInput.cron
-                    : typeof startInput?.schedule === "string"
-                      ? (startInput.schedule as string)
-                      : typeof startInput?.expression === "string"
-                        ? (startInput.expression as string)
-                        : undefined,
+                cron: pickSchedule(startInput),
                 toolUseId: ev.tool_use_id,
               };
               // Replace-by-id: if CLI re-emits the same id (e.g. snapshot + live
@@ -3058,13 +3514,11 @@ export class SessionStore {
             const result = ev.tool_use_result as Record<string, unknown> | undefined;
             const startInput = this._lookupToolStartInput(ctx, ev.tool_use_id);
             const id =
-              (typeof result?.id === "string" && result.id) ||
-              (typeof startInput?.id === "string" && (startInput.id as string)) ||
-              (typeof startInput?.task_id === "string" && (startInput.task_id as string)) ||
-              (typeof startInput?.cronId === "string" && (startInput.cronId as string)) ||
-              null;
+              (typeof result?.id === "string" && result.id) || pickCronId(startInput) || null;
             if (id) {
-              writeTasks(readTasks().filter((t) => t.id !== id));
+              const cur = readTasks();
+              const next = cur.filter((t) => t.id !== id);
+              if (next.length !== cur.length) writeTasks(next);
             } else {
               dbgWarn("store", "CronDelete tool_end could not resolve id", { result, startInput });
             }
@@ -3143,6 +3597,9 @@ export class SessionStore {
             const newPhase: SessionPhase = ev.state === "spawning" ? "spawning" : "running";
             if (ctx) ctx.phase = newPhase;
             else this._setPhase(newPhase);
+            // New turn starting — drop the previous turn's aggregated diff (live-only,
+            // not snapshotted so a ctx replay path never reaches here).
+            if (!ctx) this.turnDiff = "";
             // Invalidate idle snapshot — session is now active
             if (!ctx && this.run) {
               snapshotCache.deleteSnapshot(this.run.id).catch(() => {});
@@ -3293,7 +3750,12 @@ export class SessionStore {
         // window; clamp tokens to it so an over-counted snapshot can't exceed 100%. Only
         // raise tokens, but always adopt the latest non-zero window (200k↔1m can switch). #135
         if (hasTokens) {
-          const evUsed = u.inputTokens + u.cacheReadTokens + u.cacheWriteTokens;
+          // Context occupancy = the LAST request's tokens, NOT the turn-summed result usage,
+          // which inflates cache_read by the request count (#149). Fall back to the summed
+          // usage for older runs whose message events carry no per-request usage.
+          const lastReq = (ctx ?? this).lastReqContextTokens;
+          const evUsed =
+            lastReq > 0 ? lastReq : u.inputTokens + u.cacheReadTokens + u.cacheWriteTokens;
           let evWin = 0;
           if (u.modelUsage) {
             for (const e of Object.values(u.modelUsage)) {
@@ -3481,6 +3943,7 @@ export class SessionStore {
           // post-compaction peak. Keep the window (denominator unchanged by compaction). #135
           const hwTgt = ctx ?? this;
           hwTgt.contextHwTokens = 0;
+          hwTgt.lastReqContextTokens = 0;
         }
         // Only set lastCompactedAt during live mode — during replay
         // the timestamp would be meaningless (Date.now() ≠ original event time).
@@ -3580,7 +4043,7 @@ export class SessionStore {
         ];
         break;
 
-      case "hook_response":
+      case "hook_response": {
         this.hookEvents = [
           ...this.hookEvents,
           {
@@ -3593,7 +4056,21 @@ export class SessionStore {
             exit_code: ev.exit_code,
           },
         ];
+        // SessionStart hooks can set the session title via hookSpecificOutput.sessionTitle.
+        // Apply only when the run has no name yet — a user /rename always wins and must not be
+        // clobbered when the same SessionStart hook fires again on resume.
+        if (ev.hook_event === "SessionStart" && this.run && !this.run.name) {
+          const title = extractSessionTitle(ev.stdout);
+          if (title) {
+            const runId = this.run.id;
+            this.run = { ...this.run, name: title };
+            void import("$lib/api")
+              .then((m) => m.renameRun(runId, title))
+              .catch((e) => dbgWarn("store", "renameRun from sessionTitle failed", e));
+          }
+        }
         break;
+      }
 
       case "hook_callback":
         // Hook callback from CLI — PreToolUse hooks are actionable (allow/deny)
@@ -3666,6 +4143,40 @@ export class SessionStore {
           const updated: TimelineEntry = {
             ...old,
             tool: { ...old.tool, elapsed_time_seconds: ev.elapsed_time_seconds },
+          };
+          if (ctx) ctx.tl[idx] = updated;
+          else {
+            const u = [...this.timeline];
+            u[idx] = updated;
+            this.timeline = u;
+          }
+        }
+        break;
+      }
+
+      case "tool_output_delta": {
+        // Append a streamed output chunk to the open tool card (Codex live command
+        // output). extractOutputText reads the current {content} string ("" if absent),
+        // so deltas accumulate; tool_end later overwrites with the authoritative output.
+        if (ev.parent_tool_use_id) {
+          this._updateSubTimelineTool(
+            ev.parent_tool_use_id,
+            ev.tool_use_id,
+            (t) => ({ ...t, output: { content: extractOutputText(t.output) + ev.delta } }),
+            ctx,
+          );
+          break;
+        }
+        const tl = getTl();
+        const idx = this._findToolIdx(ctx, ev.tool_use_id);
+        if (idx >= 0) {
+          const old = tl[idx] as Extract<TimelineEntry, { kind: "tool" }>;
+          const updated: TimelineEntry = {
+            ...old,
+            tool: {
+              ...old.tool,
+              output: { content: extractOutputText(old.tool.output) + ev.delta },
+            },
           };
           if (ctx) ctx.tl[idx] = updated;
           else {
@@ -3798,6 +4309,97 @@ export class SessionStore {
           };
         }
         dbg("store", "ralph_complete", { reason: ev.reason, iteration: ev.iteration });
+        break;
+      }
+      case "goal_update": {
+        // Codex `thread/goal/updated`: merge live progress into the goal field
+        // so GoalPanel re-renders tokensUsed/timeUsedSeconds/status without
+        // polling. Backend sends `goal: null` on `thread/goal/cleared` — treat
+        // that as a reset, not a no-op merge.
+        if (ev.goal == null) {
+          this.goal = null;
+          dbg("store", "goal_update (cleared)");
+        } else {
+          this.goal = { ...(this.goal ?? {}), ...ev.goal };
+          dbg("store", "goal_update", {
+            status: ev.goal?.status,
+            tokensUsed: ev.goal?.tokensUsed,
+          });
+        }
+        break;
+      }
+
+      case "codex_hook_run": {
+        // Codex Wave-4 hook lifecycle. `hook/started` arrives with status="running",
+        // then `hook/completed` with a terminal HookRunStatus. hook_id is stable across
+        // the pair, so we UPSERT one timeline entry: update in place on completion rather
+        // than stacking a second card. Distinct hook_ids stay distinct cards.
+        dbg("store", "codex_hook_run", {
+          hook_id: ev.hook_id,
+          event_name: ev.event_name,
+          status: ev.status,
+          duration_ms: ev.duration_ms,
+        });
+        const tl = ctx ? ctx.tl : this.timeline;
+        const idx = tl.findIndex((e) => e.kind === "hook" && e.hookId === ev.hook_id);
+        if (idx >= 0) {
+          const old = tl[idx] as Extract<TimelineEntry, { kind: "hook" }>;
+          const updated: TimelineEntry = {
+            ...old,
+            status: ev.status,
+            // Merge optional fields only when present — `hook/completed` carries
+            // duration/message; `hook/started` may omit them, and we keep the prior value.
+            ...(ev.status_message !== undefined ? { statusMessage: ev.status_message } : {}),
+            ...(ev.duration_ms !== undefined ? { durationMs: ev.duration_ms } : {}),
+          };
+          if (ctx) {
+            ctx.tl[idx] = updated;
+          } else {
+            const u = [...this.timeline];
+            u[idx] = updated;
+            this.timeline = u;
+          }
+        } else {
+          const hookEntryId = uuid();
+          const entry: TimelineEntry = {
+            kind: "hook",
+            id: hookEntryId,
+            anchorId: hookEntryId,
+            hookId: ev.hook_id,
+            eventName: ev.event_name,
+            status: ev.status,
+            ...(ev.status_message !== undefined ? { statusMessage: ev.status_message } : {}),
+            ...(ev.duration_ms !== undefined ? { durationMs: ev.duration_ms } : {}),
+            ts: eventTs(ev),
+          };
+          this._pushTimeline(ctx, entry);
+        }
+        break;
+      }
+
+      case "codex_mcp_status": {
+        // Codex Wave-4: live MCP server startup-state push. Map the raw Codex status to the
+        // panel vocab and upsert store.mcpServers by name so McpStatusPanel updates without a
+        // manual refresh. Unknown server name → append (a server can appear mid-session).
+        const mapped =
+          ev.status === "ready" ? "connected" : ev.status === "starting" ? "pending" : "failed"; // failed | cancelled → failed
+        dbg("store", "codex_mcp_status", { name: ev.name, status: ev.status, mapped });
+        const existing = this.mcpServers.find((s) => s.name === ev.name);
+        const next: McpServerInfo[] = existing
+          ? this.mcpServers.map((s) =>
+              s.name === ev.name ? { ...s, status: mapped, error: ev.error } : s,
+            )
+          : [...this.mcpServers, { name: ev.name, status: mapped, error: ev.error }];
+        this.updateMcpServers(next);
+        break;
+      }
+
+      case "codex_turn_diff": {
+        // Codex Wave-4: cumulative turn diff push. The diff is aggregated across the whole
+        // turn server-side; later events supersede earlier ones, so keep the latest.
+        // Cleared at the next turn start (run_state→running) and on reset.
+        dbg("store", "codex_turn_diff", { len: ev.diff.length });
+        this.turnDiff = ev.diff;
         break;
       }
 

@@ -17,12 +17,46 @@ function makeDeps(overrides: Partial<AddDirDeps> = {}): AddDirDeps {
 }
 
 describe("executeAddDir", () => {
-  it("non-claude agent shows unsupported message, does not open dialog", async () => {
+  it("unknown agent shows unsupported message, does not open dialog", async () => {
     const deps = makeDeps();
-    await executeAddDir({ agent: "codex", sessionAlive: false, args: "" }, deps);
+    await executeAddDir({ agent: "unknown-agent", sessionAlive: false, args: "" }, deps);
 
     expect(deps.appendOutput).toHaveBeenCalledWith("[chat_addDirUnsupported]");
     expect(deps.openDirectoryDialog).not.toHaveBeenCalled();
+  });
+
+  // ── Codex-specific tests ──
+
+  it("codex + sessionAlive saves to settings (does not sendMessage), reports next-session", async () => {
+    // Codex lacks supportsLiveAddDir: it consumes writableRoots once at spawn
+    // (first turn/start), so a mid-session add-dir is persisted and only takes
+    // effect on the next session / new thread — never the current thread. With a
+    // live session we surface the "next session" wording.
+    const deps = makeDeps({
+      getAgentSettings: vi.fn().mockResolvedValue({ add_dirs: [] }),
+    });
+    await executeAddDir({ agent: "codex", sessionAlive: true, args: "/tmp/codex-dir" }, deps);
+
+    expect(deps.sendMessage).not.toHaveBeenCalled();
+    expect(deps.updateAgentSettings).toHaveBeenCalledWith("codex", {
+      add_dirs: ["/tmp/codex-dir"],
+    });
+    const call = (deps.appendOutput as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    expect(call).toContain("chat_addDirNextSession");
+  });
+
+  it("codex + sessionAlive=false is a plain pre-session save", async () => {
+    const deps = makeDeps({
+      getAgentSettings: vi.fn().mockResolvedValue({ add_dirs: [] }),
+    });
+    await executeAddDir({ agent: "codex", sessionAlive: false, args: "/tmp/codex-dir" }, deps);
+
+    expect(deps.sendMessage).not.toHaveBeenCalled();
+    expect(deps.updateAgentSettings).toHaveBeenCalledWith("codex", {
+      add_dirs: ["/tmp/codex-dir"],
+    });
+    const call = (deps.appendOutput as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    expect(call).toContain("chat_addDirSaved");
   });
 
   it("user cancels dialog — no further action", async () => {

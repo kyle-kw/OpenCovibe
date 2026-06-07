@@ -14,6 +14,7 @@
     planFileName,
     isPlanFilePath,
     extractTaskToolMeta,
+    isSubagentTool,
     shouldShowSubTimeline as _shouldShow,
     getToolRenderLevel,
     getToolDetail,
@@ -39,6 +40,7 @@
     planContent,
     latestPlanTool,
     showPermissionInPanel,
+    agentDisplayName,
     onPreviewFile,
   }: {
     tool: BusToolItem;
@@ -68,13 +70,15 @@
     latestPlanTool?: boolean;
     /** Whether generic tool permissions are handled by the floating PermissionPanel. */
     showPermissionInPanel?: boolean;
+    /** Display name for the agent (e.g. "Claude" or "Codex"). */
+    agentDisplayName?: string;
     /** Click on Edit/Write/Read tool card's file path → open preview in right panel. */
     onPreviewFile?: (path: string) => void;
   } = $props();
 
   // Look up the task notification for this specific Task tool
   let taskNotification = $derived.by(() => {
-    if (tool.tool_name !== "Task" || !taskNotifications) return undefined;
+    if (!isSubagentTool(tool.tool_name) || !taskNotifications) return undefined;
     for (const n of taskNotifications.values()) {
       if (n.tool_use_id === tool.tool_use_id) return n;
     }
@@ -142,7 +146,7 @@
     submitting = false;
   });
 
-  let isAgentLike = $derived(tool.tool_name === "Agent" || tool.tool_name === "Task");
+  let isAgentLike = $derived(isSubagentTool(tool.tool_name));
   let isAsk = $derived(tool.tool_name === "AskUserQuestion");
 
   // Auto-expand when input is streaming in (running + has input data)
@@ -220,7 +224,18 @@
   });
 
   // Task (subagent) meta: extract agent type + model for enhanced header
-  let taskMeta = $derived(tool.tool_name === "Task" ? extractTaskToolMeta(tool.input) : null);
+  let taskMeta = $derived(isSubagentTool(tool.tool_name) ? extractTaskToolMeta(tool.input) : null);
+
+  // Codex collab subagent: rendered as tool_name "Agent" but with a codexCollab marker and a
+  // different input shape (operation, not subagent_type). Marker may ride on input or result.
+  let codexCollabOp = $derived.by<string | null>(() => {
+    if (!isSubagentTool(tool.tool_name)) return null;
+    const inp = tool.input as Record<string, unknown> | undefined;
+    if (inp?.codexCollab && typeof inp.operation === "string") return inp.operation;
+    const res = tool.tool_use_result as Record<string, unknown> | undefined;
+    if (res?.codexCollab && typeof res.operation === "string") return res.operation;
+    return null;
+  });
 
   // Status display
   let statusKind = $derived(
@@ -260,6 +275,7 @@
     description: string;
   }
   interface ParsedQuestion {
+    id: string;
     question: string;
     header: string;
     options: ParsedOption[];
@@ -286,6 +302,7 @@
       return questions.map((q: unknown) => {
         const qr = q as Record<string, unknown>;
         return {
+          id: typeof qr?.id === "string" ? qr.id : "",
           question: typeof qr?.question === "string" ? qr.question : "",
           header: typeof qr?.header === "string" ? qr.header : "",
           options: extractOptions(qr?.options),
@@ -297,6 +314,7 @@
     if (typeof tool.input.question === "string") {
       return [
         {
+          id: typeof tool.input.id === "string" ? tool.input.id : "",
           question: tool.input.question,
           header: "",
           options: extractOptions(tool.input.options as unknown),
@@ -518,6 +536,22 @@
     questionAnswers[questionText] = answer;
   }
 
+  // Multi-question submit for the ask_pending (onAnswer) path — used by Codex app-server
+  // (and Claude pipe mode) where the answer goes back via onAnswer, not a permission response.
+  // Encodes all answers keyed by both question id (for Codex respond_user_input) and text.
+  function submitAllAskAnswers() {
+    if (submitting || !onAnswer || !allQuestionsAnswered) return;
+    submitting = true;
+    const byId: Record<string, string> = {};
+    const byText: Record<string, string> = {};
+    for (const q of parsedQuestions) {
+      const ans = questionAnswers[q.question];
+      byText[q.question] = ans;
+      if (q.id) byId[q.id] = ans;
+    }
+    onAnswer(JSON.stringify({ __askMulti: true, byId, byText }));
+  }
+
   // Multi-question: submit all answers at once
   function submitAllQuestionAnswers() {
     if (submitting || !onPermissionRespond || !tool.permission_request_id) return;
@@ -581,7 +615,53 @@
   {#if renderLevel === 3}
     <!-- Level 3: interactive card -->
     <div>
-      {#if isAsk && (tool.status === "running" || tool.status === "ask_pending") && askQuestion}
+      {#if isAsk && (tool.status === "running" || tool.status === "ask_pending") && hasMultipleQuestions && onAnswer}
+        <!-- AskUserQuestion (multi-question, onAnswer path): collect all answers, submit once.
+             Used by Codex app-server requestUserInput with 2+ questions. -->
+        <div class="rounded-lg border border-yellow-500/30 bg-yellow-500/5 px-4 py-3">
+          <div class="flex items-center gap-2 mb-3">
+            <span class="text-xs font-medium text-foreground">{t("inline_question")}</span>
+            <span class="text-xs text-muted-foreground"
+              >{Object.keys(questionAnswers).length}/{parsedQuestions.length}</span
+            >
+          </div>
+          <div class="space-y-3">
+            {#each parsedQuestions as pq}
+              <div>
+                {#if pq.header}
+                  <div class="text-xs font-medium text-muted-foreground mb-1">{pq.header}</div>
+                {/if}
+                <MarkdownContent
+                  text={pq.question}
+                  class="text-sm text-foreground mb-2 [&>*:last-child]:mb-0"
+                />
+                <div class="flex flex-wrap gap-2">
+                  {#each pq.options as option}
+                    <button
+                      class="rounded-md border px-3 py-1.5 text-xs font-medium transition-all disabled:opacity-50 disabled:cursor-not-allowed {questionAnswers[
+                        pq.question
+                      ] === option.label
+                        ? 'border-primary bg-primary/10 text-primary'
+                        : 'border-border bg-background text-foreground hover:bg-accent hover:border-ring/30'}"
+                      disabled={submitting}
+                      onclick={() => selectQuestionAnswer(pq.question, option.label)}
+                    >
+                      {option.label}
+                    </button>
+                  {/each}
+                </div>
+              </div>
+            {/each}
+          </div>
+          <button
+            class="mt-3 rounded-md bg-primary px-4 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+            disabled={submitting || !allQuestionsAnswered}
+            onclick={submitAllAskAnswers}
+          >
+            {t("inline_submit")}
+          </button>
+        </div>
+      {:else if isAsk && (tool.status === "running" || tool.status === "ask_pending") && askQuestion}
         <!-- AskUserQuestion: show question + option buttons -->
         <div class="rounded-lg border border-yellow-500/30 bg-yellow-500/5 px-4 py-3">
           <div class="flex items-center gap-2 mb-2">
@@ -1433,7 +1513,8 @@
             </div>
           </div>
           <p class="text-sm text-foreground mb-1">
-            {t("inline_claudeWantsToUse")} <strong>{tool.tool_name}</strong>
+            {t("inline_agentWantsToUse", { agent: agentDisplayName ?? "Claude" })}
+            <strong>{tool.tool_name}</strong>
           </p>
           {#if detail}
             <p
@@ -1542,7 +1623,20 @@
 
       <!-- Tool name + detail -->
       <div class="flex-1 min-w-0 flex items-center gap-1.5">
-        {#if taskMeta}
+        {#if codexCollabOp}
+          <!-- Codex collab subagent: "Sub-agent · {operation}" -->
+          <span class="text-xs font-medium text-foreground">{t("inline_subagent")}</span>
+          <span class="text-xs text-muted-foreground">· {codexCollabOp}</span>
+          {#if subToolCount > 0}
+            <span class="text-[10px] px-1 py-0.5 rounded bg-muted text-muted-foreground">
+              {#if tool.status === "running"}
+                {subToolCompleted}/{subToolCount} tools
+              {:else}
+                {t("inline_toolCount", { count: String(subToolCount) })}
+              {/if}
+            </span>
+          {/if}
+        {:else if taskMeta}
           <!-- Task tool: show agent type + model badge -->
           <span class="text-xs font-medium text-foreground">{taskMeta.subagentType}</span>
           {#if taskMeta.model}
@@ -1764,6 +1858,7 @@
             {onPermissionRespond}
             {taskNotifications}
             {showPermissionInPanel}
+            {agentDisplayName}
             {onPreviewFile}
           />
         {/if}

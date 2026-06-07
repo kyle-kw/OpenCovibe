@@ -19,12 +19,12 @@ describe("serializeAgentFile", () => {
       disallowedTools: ["Write"],
       permissionMode: "plan",
       maxTurns: 10,
+      effort: "high",
       memory: "MEMORY.md",
       background: true,
       isolation: "worktree",
-      systemPrompt: "You are a code reviewer.",
-      effort: "",
       initialPrompt: "",
+      systemPrompt: "You are a code reviewer.",
     };
     const result = serializeAgentFile(data);
     expect(result).toContain("name: code-reviewer");
@@ -86,12 +86,12 @@ describe("parseAgentFile", () => {
       disallowedTools: ["Write"],
       permissionMode: "plan",
       maxTurns: 5,
+      effort: "medium",
       memory: "MEMORY.md",
       background: true,
       isolation: "worktree",
+      initialPrompt: "Start reviewing",
       systemPrompt: "You are a test agent.",
-      effort: "",
-      initialPrompt: "",
     };
     const serialized = serializeAgentFile(original);
     const parsed = parseAgentFile(serialized);

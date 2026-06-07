@@ -98,6 +98,14 @@ impl std::fmt::Display for RunEventType {
     }
 }
 
+/// Attachment metadata (name/type/size — no content blob).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentMeta {
+    pub name: String,
+    pub mime_type: String,
+    pub size: u64,
+}
+
 /// App-internal execution path — which backend subsystem handles this run.
 /// NOT a protocol description; a single agent may support multiple paths.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -245,6 +253,14 @@ pub struct UserSettings {
     pub platform_credentials: Vec<PlatformCredential>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_platform_id: Option<String>,
+    /// Active Codex third-party provider (OpenAI Responses API). None = plain `codex login`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_provider: Option<CodexProviderCredential>,
+    /// Codex session transport: "app_server" (bidirectional JSON-RPC — interactive tools:
+    /// approvals, requestUserInput, MCP elicitation) or "exec" (one-way NDJSON, no interactivity).
+    /// None / "exec" = legacy exec path. Drives the default execution_path for new Codex runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_transport: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_zoom: Option<f64>,
     #[serde(default)]
@@ -322,6 +338,33 @@ pub struct PlatformCredential {
     pub extra_env: Option<HashMap<String, String>>,
 }
 
+/// A Codex third-party provider (OpenAI Responses API). Unlike Claude's Anthropic-shaped
+/// PlatformCredential, Codex providers are injected via `codex exec -c model_providers.<id>.*`
+/// overrides + an env var (env_key → api_key), not ANTHROPIC_* env. wire_api is always
+/// "responses" (Codex removed "chat" in 0.99+).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexProviderCredential {
+    /// Stable provider id used as the `model_providers.<id>` table key (e.g. "vercel", "custom").
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    /// Name of the env var Codex reads the API key from (e.g. "OPENAI_API_KEY").
+    pub env_key: String,
+    /// Always "responses" for current Codex; kept explicit for forward-compat.
+    #[serde(default = "default_wire_api")]
+    pub wire_api: String,
+    /// Provider-side model id (OpenAI-format, e.g. "gpt-5.5"). Empty → Codex default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// API key. Optional for keyless local providers (e.g. Ollama).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+fn default_wire_api() -> String {
+    "responses".to_string()
+}
+
 impl Default for UserSettings {
     fn default() -> Self {
         Self {
@@ -341,6 +384,8 @@ impl Default for UserSettings {
             remote_hosts: vec![],
             platform_credentials: vec![],
             active_platform_id: None,
+            codex_provider: None,
+            codex_transport: None,
             ui_zoom: None,
             onboarding_completed: false,
             web_server_enabled: None,
@@ -395,6 +440,25 @@ pub struct AgentSettings {
     /// Custom agent definitions JSON string (passed to --agents flag).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents_json: Option<String>,
+    /// Agent-scoped permission mode override (app names: "ask", "auto_all", "plan", etc.).
+    /// Takes priority over plan_mode and user.permission_mode in adapter resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    /// Codex `--ephemeral` — disable on-disk session persistence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral: Option<bool>,
+    /// Codex `--profile <name>` — select a profile from ~/.codex/config.toml.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Codex `--ignore-user-config` — skip ~/.codex/config.toml.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_user_config: Option<bool>,
+    /// Codex `--ignore-rules` — skip execpolicy .rules files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_rules: Option<bool>,
+    /// Codex `--search` — enable the native web_search tool (new sessions only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<bool>,
     pub updated_at: String,
 }
 
@@ -421,6 +485,12 @@ impl AgentSettings {
             effort: None,
             betas: None,
             agents_json: None,
+            permission_mode: None,
+            ephemeral: None,
+            profile: None,
+            ignore_user_config: None,
+            ignore_rules: None,
+            web_search: None,
             updated_at: now_iso(),
         }
     }
@@ -515,6 +585,30 @@ pub struct RunMeta {
     /// Unified resume identity. None = not resumable. Written by runtime events (session_init / thread.started).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_ref: Option<ConversationRef>,
+    /// Codex process invocation counter. Incremented each run_agent() call for the same run.
+    /// Used to scope item IDs across resume processes. None = not a Codex run or legacy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_process_seq: Option<u32>,
+    /// Codex CLI import: list of rollout files imported into this run.
+    /// Used by `sync_cli_session` to detect newly produced rollout files for the
+    /// same thread (Codex resume produces a new rollout file rather than appending).
+    /// None for Claude or non-imported runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_imported_rollouts: Option<Vec<CodexImportedRollout>>,
+}
+
+/// Codex rollout file that has been imported into a run.
+///
+/// `mtime_ns` is a stringified u128 (nanoseconds since UNIX epoch) — JS can't
+/// safely represent u128 as a number, so we serialize as decimal string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexImportedRollout {
+    pub path: String,
+    pub size: u64,
+    pub mtime_ns: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_ts: Option<String>,
 }
 
 impl RunMeta {
@@ -627,6 +721,15 @@ pub struct CliCheckResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexAuthResult {
+    pub installed: bool,
+    pub version: Option<String>,
+    pub logged_in: bool,
+    pub auth_method: Option<String>,
+    pub status_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliDistTags {
     pub latest: Option<String>,
     pub stable: Option<String>,
@@ -636,6 +739,8 @@ pub struct CliDistTags {
 pub struct ProjectInitStatus {
     pub cwd: String,
     pub has_claude_md: bool,
+    #[serde(default)]
+    pub has_agents_md: bool,
 }
 
 // ── Diagnostics report (run_diagnostics command) ──
@@ -648,6 +753,8 @@ pub struct DiagnosticsReport {
     pub configs: ConfigDiagnostics,
     pub services: ServicesDiagnostics,
     pub system: SystemDiagnostics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex: Option<CodexAuthResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -677,11 +784,19 @@ pub struct ProjectDiagnostics {
     pub cwd: String,
     pub has_claude_md: bool,
     pub claude_md_files: Vec<ClaudeMdInfo>,
+    pub has_agents_md: bool,
+    pub agents_md_files: Vec<AgentsMdInfo>,
     pub skipped_project_scope: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClaudeMdInfo {
+    pub path: String,
+    pub size_chars: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentsMdInfo {
     pub path: String,
     pub size_chars: usize,
 }
@@ -747,6 +862,8 @@ pub struct RunUsageSummary {
     pub num_turns: u64,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub model_usage: HashMap<String, ModelUsageSummary>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cost_estimated: bool,
 }
 
 /// Per-model token and cost summary.
@@ -891,6 +1008,17 @@ pub struct CliInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_model: Option<String>,
     pub fetched_at: String,
+}
+
+/// Codex model catalog fetched live from `codex app-server` (model/list).
+/// Unlike Claude (see CliInfo), Codex has no control protocol on the exec path,
+/// so models are pulled via the experimental app-server JSON-RPC instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexModelList {
+    pub models: Vec<CliModelInfo>,
+    /// The model marked `isDefault` in the catalog — used when the user hasn't picked one.
+    #[serde(rename = "defaultModel", skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1053,8 +1181,15 @@ pub enum BusEvent {
     UserMessage {
         run_id: String,
         text: String,
+        /// CLI-assigned UUID (Claude actor path).
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
+        /// Frontend-generated UUID for optimistic dedup (Codex pipe path).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_uuid: Option<String>,
+        /// Attachment metadata (names/types/sizes — no content).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<AttachmentMeta>,
     },
     RunState {
         run_id: String,
@@ -1212,6 +1347,54 @@ pub enum BusEvent {
         data: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
+    },
+    /// Incremental tool output chunk — top-level event type "tool_output_delta".
+    /// Appends to an open tool card's output (keyed by `tool_use_id`) so command
+    /// output streams live instead of only appearing at completion. Codex source:
+    /// `item/commandExecution/outputDelta`.
+    ToolOutputDelta {
+        run_id: String,
+        tool_use_id: String,
+        delta: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
+    /// Codex thread goal update — top-level event type "goal_update". Carries the `ThreadGoal`
+    /// object verbatim (`{threadId, objective, status, tokenBudget?, tokensUsed,
+    /// timeUsedSeconds, createdAt, updatedAt}`) from the `thread/goal/updated` notification, or
+    /// `Value::Null` when the goal was cleared (`thread/goal/cleared`). The GoalPanel renders it.
+    GoalUpdate { run_id: String, goal: Value },
+    /// Codex hook lifecycle (`hook/started` → status "running", `hook/completed` → terminal
+    /// HookRunStatus). `hook_id` (= run.id) is stable across the pair so the frontend upserts a
+    /// single timeline card. `event_name` is the camelCase HookEventName (e.g. "preToolUse").
+    CodexHookRun {
+        run_id: String,
+        hook_id: String,
+        event_name: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status_message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
+    /// Codex MCP server startup-state change (`mcpServer/startupStatus/updated`). Live push so the
+    /// MCP status panel updates without a manual refresh. `status` is the raw Codex
+    /// McpServerStartupState ("starting"|"ready"|"failed"|"cancelled"); the frontend maps it to the
+    /// panel vocabulary. Not replayed — ephemeral session state, like goal updates.
+    CodexMcpStatus {
+        run_id: String,
+        name: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Codex turn-level aggregated unified diff (`turn/diff/updated`). `diff` is the cumulative
+    /// diff across all file changes in the turn; later pushes supersede earlier ones (latest
+    /// wins). Not replayed — ephemeral live state cleared at the next turn, like goal/mcp status.
+    CodexTurnDiff {
+        run_id: String,
+        turn_id: String,
+        diff: String,
     },
     /// Tool use summary — top-level event type "tool_use_summary".
     ToolUseSummary {
@@ -1462,17 +1645,76 @@ pub struct MarketplaceInfo {
     pub plugin_count: usize,
 }
 
+/// Source kind for Codex skills (mirrors loader.rs scan order).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SkillSourceKind {
+    User,          // $HOME/.agents/skills/
+    ProjectAgents, // {layer}/.agents/skills/
+    ProjectCodex,  // {layer}/.codex/skills/
+    Legacy,        // $CODEX_HOME/skills/ (non .system/)
+    Bundled,       // $CODEX_HOME/skills/.system/
+}
+
+/// How a Codex skill was disabled.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SkillDisabledBy {
+    Path,    // path rule match
+    Name,    // name rule match
+    Bundled, // [skills.bundled] enabled=false
+}
+
+fn default_agent_claude() -> String {
+    "claude".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StandaloneSkill {
     pub name: String,
     pub description: String,
     pub path: String,
-    /// "user" or "project"
+    /// "user" or "project" or "system"
     #[serde(default)]
     pub scope: String,
+    #[serde(default = "default_agent_claude")]
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<SkillSourceKind>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_by: Option<SkillDisabledBy>,
+    #[serde(default = "default_true")]
+    pub can_edit: bool,
+    #[serde(default = "default_true")]
+    pub can_delete: bool,
+    #[serde(default = "default_true")]
+    pub can_toggle: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Default for StandaloneSkill {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            path: String::new(),
+            scope: String::new(),
+            agent: "claude".into(),
+            source_kind: None,
+            enabled: true,
+            disabled_by: None,
+            can_edit: true,
+            can_delete: true,
+            can_toggle: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InstalledPlugin {
     #[serde(default, alias = "id")]
     pub name: String,
@@ -1488,6 +1730,8 @@ pub struct InstalledPlugin {
     pub marketplace: Option<String>,
     #[serde(default, rename = "pluginId")]
     pub plugin_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// Project directory this plugin was installed in (project/local scope only).
     #[serde(
         default,
@@ -1639,6 +1883,24 @@ pub struct ConfiguredMcpServer {
     pub env_keys: Vec<String>,
     #[serde(default)]
     pub header_keys: Vec<String>,
+    #[serde(default = "default_agent_claude")]
+    pub agent: String,
+}
+
+impl Default for ConfiguredMcpServer {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            server_type: String::new(),
+            scope: String::new(),
+            command: None,
+            args: vec![],
+            url: None,
+            env_keys: vec![],
+            header_keys: vec![],
+            agent: "claude".into(),
+        }
+    }
 }
 
 // ── Keybinding types ──

@@ -16,14 +16,24 @@ const CLAUDE_FEATURES: AgentFeatures = {
 };
 
 const CODEX_FEATURES: AgentFeatures = {
+  // Codex reads reasoning effort from the selected model's supportedReasoningEfforts.
+  // Over the app-server transport the model/effort/permission overrides apply live on
+  // the next turn (control protocol: set_effort / set_model / set_permission_mode);
+  // they also persist to agent settings for future spawns.
+  effortSelector: true,
+  planModeToggle: true,
+  permissionModeSwitch: true,
+  slashCommandMenu: true,
+  addDirAction: true,
+};
+
+const MINIMAL_FEATURES: AgentFeatures = {
   effortSelector: false,
   planModeToggle: false,
   permissionModeSwitch: false,
-  slashCommandMenu: false,
+  slashCommandMenu: true,
   addDirAction: false,
 };
-
-const MINIMAL_FEATURES: AgentFeatures = { ...CODEX_FEATURES };
 
 const FEATURES_MAP: Record<string, AgentFeatures> = {
   claude: CLAUDE_FEATURES,

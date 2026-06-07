@@ -1,29 +1,38 @@
 <script lang="ts">
   import { onMount, getContext } from "svelte";
+  import { goto } from "$app/navigation";
   import { page } from "$app/stores";
   import * as api from "$lib/api";
   import { loadCliInfo, KeybindingStore } from "$lib/stores";
   import type {
     UserSettings,
+    AgentSettings,
     CliConfigSettingDef,
     RemoteHost,
     RemoteTestResult,
     SshKeyInfo,
+    CodexAuthResult,
   } from "$lib/types";
   import Card from "$lib/components/Card.svelte";
   import Button from "$lib/components/Button.svelte";
   import Input from "$lib/components/Input.svelte";
   import KeybindingEditor from "$lib/components/KeybindingEditor.svelte";
+  import ProviderIcon from "$lib/components/ProviderIcon.svelte";
   import { formatKeyDisplay } from "$lib/stores/keybindings.svelte";
   import {
     PLATFORM_PRESETS,
+    PRESET_CATEGORIES,
     buildPlatformList,
     isCustomPlatform,
     findCredential,
     expandModelsToTiers,
     compressModelsFromTiers,
   } from "$lib/utils/platform-presets";
-  import type { PlatformPreset, PlatformCredential } from "$lib/types";
+  import type { PlatformPreset, PlatformCredential, CodexProviderCredential } from "$lib/types";
+  import {
+    CODEX_PROVIDER_PRESETS,
+    type CodexProviderPreset,
+  } from "$lib/utils/codex-provider-presets";
   import {
     isDebugMode,
     setDebugMode,
@@ -110,6 +119,22 @@
 
   // Derive merged platform list (static presets + dynamic custom endpoints)
   let platformList = $derived(buildPlatformList(platformCredentials));
+
+  // Group platforms by category for the grid; sort alphabetically within each group,
+  // but pin Anthropic first (official default) in the provider group.
+  let groupedPlatforms = $derived.by(() => {
+    const groups: { id: string; label: string; items: PlatformPreset[] }[] = [];
+    for (const cat of PRESET_CATEGORIES) {
+      const items = platformList.filter((p) => p.id !== "custom" && p.category === cat.id);
+      const sorted = [...items].sort((a, b) => a.name.localeCompare(b.name));
+      if (cat.id === "provider") {
+        const idx = sorted.findIndex((p) => p.id === "anthropic");
+        if (idx > 0) sorted.unshift(sorted.splice(idx, 1)[0]);
+      }
+      groups.push({ id: cat.id, label: cat.label, items: sorted });
+    }
+    return groups;
+  });
 
   // Derive selected platform from id (search merged list, not just static presets)
   let selectedPlatform = $derived<PlatformPreset | null>(
@@ -528,6 +553,7 @@
   // Keybinding store from layout context
   const keybindingStore = getContext<KeybindingStore>("keybindings");
   let cliSectionOpen = $state(false);
+  let codexCliSectionOpen = $state(false);
   let cliSource = $state<"defaults" | "file">("defaults");
 
   // Keybinding conflict warning for recording editor
@@ -541,6 +567,7 @@
     keybindingStore.resolved.filter((b) => b.source === "app" && !b.editable),
   );
   let cliBindings = $derived(keybindingStore.resolved.filter((b) => b.source === "cli"));
+  let codexCliBindings = $derived(keybindingStore.resolved.filter((b) => b.source === "codex"));
   let hasOverrides = $derived(keybindingStore.overrides.length > 0);
 
   function isOverridden(command: string): boolean {
@@ -550,6 +577,199 @@
   function getConflictWarning(key: string, context: string, excludeCmd: string): string {
     const conflict = keybindingStore.findConflict(key, context, excludeCmd);
     return conflict ? t("settings_shortcuts_conflictsWith", { label: conflict.label }) : "";
+  }
+
+  // ── Codex status ──
+  let codexStatus = $state<CodexAuthResult | null>(null);
+  let codexStatusLoading = $state(false);
+
+  async function loadCodexStatus() {
+    codexStatusLoading = true;
+    try {
+      codexStatus = await api.checkCodexAuth();
+    } catch {
+      codexStatus = null;
+    } finally {
+      codexStatusLoading = false;
+    }
+  }
+
+  // ── codex doctor (richer install/config/auth/runtime diagnostics) ──
+  let codexDoctor = $state<api.CodexDoctorReport | null>(null);
+  let codexDoctorLoading = $state(false);
+  let codexDoctorError = $state("");
+
+  async function runCodexDoctor() {
+    codexDoctorLoading = true;
+    codexDoctorError = "";
+    try {
+      codexDoctor = await api.runCodexDoctor();
+      dbg("settings", "codex doctor", { overall: codexDoctor.overallStatus });
+    } catch (e) {
+      codexDoctorError = String(e);
+      codexDoctor = null;
+    } finally {
+      codexDoctorLoading = false;
+    }
+  }
+
+  // Sort doctor checks: problems first (fail → warn → ok), then by id.
+  let codexDoctorChecks = $derived.by(() => {
+    if (!codexDoctor) return [];
+    const rank = (s: string) => (s === "fail" ? 0 : s === "warn" ? 1 : 2);
+    return Object.values(codexDoctor.checks).sort(
+      (a, b) => rank(a.status) - rank(b.status) || a.id.localeCompare(b.id),
+    );
+  });
+
+  function doctorStatusClass(status: string): string {
+    if (status === "ok") return "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400";
+    if (status === "warn") return "bg-amber-500/10 text-amber-600 dark:text-amber-400";
+    if (status === "fail") return "bg-red-500/10 text-red-600 dark:text-red-400";
+    return "bg-muted text-muted-foreground";
+  }
+
+  // ── Codex per-session flags (AgentSettings on codex agent) ──
+  let codexAgentSettings = $state<AgentSettings | null>(null);
+
+  async function loadCodexAgentSettings() {
+    try {
+      codexAgentSettings = await api.getAgentSettings("codex");
+      dbg("settings", "codex agent settings loaded", codexAgentSettings);
+    } catch (e) {
+      dbgWarn("settings", "loadCodexAgentSettings failed", e);
+      codexAgentSettings = null;
+    }
+  }
+
+  async function saveCodexAgentPatch(patch: Partial<AgentSettings>) {
+    if (!codexAgentSettings) return;
+    try {
+      const updated = await api.updateAgentSettings("codex", patch);
+      codexAgentSettings = updated;
+      dbg("settings", "codex agent settings saved", patch);
+    } catch (e) {
+      dbgWarn("settings", "saveCodexAgentPatch failed", e);
+    }
+  }
+
+  // ── Codex third-party provider ──
+  // Draft form state for the Codex provider section (committed via saveCodexProvider).
+  let codexProviderId = $state<string>(""); // "" = None (plain codex login)
+  let codexProviderKey = $state("");
+  let codexProviderModel = $state("");
+  let codexProviderBaseUrl = $state(""); // editable for "custom"
+  // Auth Mode toggle, mirroring Claude: "cli" = codex login (provider None),
+  // "app" = app points Codex at a third-party Responses provider. Explicit
+  // state (not derived) so "app" can be selected before a preset is picked.
+  let codexAuthMode = $state<"cli" | "app">("cli");
+
+  // Initialize the draft from the saved provider once settings load.
+  let codexProviderInitDone = false;
+  $effect(() => {
+    if (!settings || codexProviderInitDone) return;
+    codexProviderInitDone = true;
+    const cp = settings.codex_provider;
+    if (cp) {
+      codexProviderId = cp.id;
+      codexProviderKey = cp.api_key ?? "";
+      codexProviderModel = cp.model ?? "";
+      codexProviderBaseUrl = cp.base_url ?? "";
+      codexAuthMode = "app";
+    }
+  });
+
+  function setCodexAuthMode(mode: "cli" | "app") {
+    codexAuthMode = mode;
+    // CLI Auth clears any app-managed provider (back to codex login default),
+    // mirroring Claude's CLI-Auth toggle which clears platform/base_url config.
+    if (mode === "cli") selectCodexProvider(null);
+  }
+
+  function selectCodexProvider(preset: CodexProviderPreset | null) {
+    if (!preset) {
+      codexProviderId = "";
+      void saveCodexProvider(null);
+      return;
+    }
+    codexProviderId = preset.id;
+    codexProviderModel = preset.model;
+    codexProviderBaseUrl = preset.base_url;
+    if (preset.keyless) codexProviderKey = "";
+  }
+
+  async function saveCodexProvider(clear?: null) {
+    if (clear === null || !codexProviderId) {
+      settings = await api.updateUserSettings({ codex_provider: null } as Partial<UserSettings>);
+      return;
+    }
+    const preset = CODEX_PROVIDER_PRESETS.find((p) => p.id === codexProviderId);
+    if (!preset) return;
+    const cred: CodexProviderCredential = {
+      id: preset.id,
+      name: preset.name,
+      base_url: codexProviderBaseUrl.trim() || preset.base_url,
+      env_key: preset.env_key,
+      wire_api: "responses",
+      model: codexProviderModel.trim(),
+      api_key: preset.keyless ? undefined : codexProviderKey.trim() || undefined,
+    };
+    settings = await api.updateUserSettings({
+      codex_provider: cred,
+    } as Partial<UserSettings>);
+    dbg("settings", "codex provider saved", { id: cred.id });
+  }
+
+  let codexProviderPreset = $derived(
+    CODEX_PROVIDER_PRESETS.find((p) => p.id === codexProviderId) ?? null,
+  );
+
+  // ── Codex hooks count ──
+  let codexHooksCount = $state<number | null>(null);
+
+  async function loadCodexHooksCount() {
+    dbg("settings", "loadCodexHooksCount");
+    try {
+      const { hooks } = await api.getCodexHooks();
+      let count = 0;
+      for (const groups of Object.values(hooks)) {
+        if (Array.isArray(groups)) count += groups.length;
+      }
+      codexHooksCount = count;
+      dbg("settings", "codex hooks loaded", { count: codexHooksCount });
+    } catch (e) {
+      dbgWarn("settings", "loadCodexHooksCount failed", e);
+      codexHooksCount = null;
+    }
+  }
+
+  async function refreshCodexAll() {
+    await loadCodexStatus();
+    if (codexStatus?.installed) {
+      loadCodexHooksCount();
+      loadCodexAgentSettings();
+    } else {
+      codexHooksCount = null;
+      codexAgentSettings = null;
+    }
+  }
+
+  // ── Codex login ──
+  let codexLoginLoading = $state(false);
+  let codexLoginError = $state("");
+
+  async function handleCodexLogin() {
+    codexLoginLoading = true;
+    codexLoginError = "";
+    try {
+      await api.runCodexLogin();
+      await refreshCodexAll();
+    } catch (e) {
+      codexLoginError = e instanceof Error ? e.message : String(e);
+      dbgWarn("settings", "codex login failed", e);
+    } finally {
+      codexLoginLoading = false;
+    }
   }
 
   // ── CLI Config state ──
@@ -747,6 +967,152 @@
   const appearanceSettings = CLI_CONFIG_SETTINGS.filter((s) => s.group === "appearance");
   const advancedSettings = CLI_CONFIG_SETTINGS.filter((s) => s.group === "advanced");
 
+  // ── Codex Config state ──
+  let codexConfig = $state<Record<string, unknown>>({});
+  let projectCodexConfig = $state<Record<string, unknown>>({});
+  let codexConfigWarning = $state<string | undefined>(undefined);
+
+  // Codex Config setting definitions
+  const CODEX_CONFIG_SETTINGS: CliConfigSettingDef[] = [
+    {
+      key: "model",
+      label: t("settings_codexConfig_modelLabel"),
+      description: t("settings_codexConfig_modelDesc"),
+      group: "behavior",
+      type: "string",
+      default: undefined,
+    },
+    {
+      key: "model_reasoning_effort",
+      label: t("settings_codexConfig_reasoningEffortLabel"),
+      description: t("settings_codexConfig_reasoningEffortDesc"),
+      group: "behavior",
+      type: "enum",
+      default: "medium",
+      options: [
+        { value: "none", label: t("settings_codexConfig_optNone") },
+        { value: "minimal", label: t("settings_codexConfig_optMinimal") },
+        { value: "low", label: t("settings_codexConfig_optLow") },
+        { value: "medium", label: t("settings_codexConfig_optMedium") },
+        { value: "high", label: t("settings_codexConfig_optHigh") },
+        { value: "xhigh", label: t("settings_codexConfig_optXHigh") },
+      ],
+    },
+    {
+      key: "model_reasoning_summary",
+      label: t("settings_codexConfig_reasoningSummaryLabel"),
+      description: t("settings_codexConfig_reasoningSummaryDesc"),
+      group: "behavior",
+      type: "enum",
+      default: "auto",
+      options: [
+        { value: "none", label: t("settings_codexConfig_optNone") },
+        { value: "auto", label: t("settings_codexConfig_optAuto") },
+        { value: "concise", label: t("settings_codexConfig_optConcise") },
+        { value: "detailed", label: t("settings_codexConfig_optDetailed") },
+      ],
+    },
+    {
+      key: "model_verbosity",
+      label: t("settings_codexConfig_verbosityLabel"),
+      description: t("settings_codexConfig_verbosityDesc"),
+      group: "behavior",
+      type: "enum",
+      default: "medium",
+      options: [
+        { value: "low", label: t("settings_codexConfig_optLow") },
+        { value: "medium", label: t("settings_codexConfig_optMedium") },
+        { value: "high", label: t("settings_codexConfig_optHigh") },
+      ],
+    },
+    {
+      key: "personality",
+      label: t("settings_codexConfig_personalityLabel"),
+      description: t("settings_codexConfig_personalityDesc"),
+      group: "behavior",
+      type: "string",
+      default: undefined,
+    },
+    {
+      key: "approval_policy",
+      label: t("settings_codexConfig_approvalPolicyLabel"),
+      description: t("settings_codexConfig_approvalPolicyDesc"),
+      group: "behavior",
+      type: "enum",
+      default: "on-request",
+      options: [
+        { value: "on-request", label: t("settings_codexConfig_optOnRequest") },
+        { value: "untrusted", label: t("settings_codexConfig_optUntrusted") },
+        { value: "on-failure", label: t("settings_codexConfig_optOnFailure") },
+        { value: "never", label: t("settings_codexConfig_optNever") },
+      ],
+    },
+    {
+      key: "sandbox_mode",
+      label: t("settings_codexConfig_sandboxLabel"),
+      description: t("settings_codexConfig_sandboxDesc"),
+      group: "behavior",
+      type: "enum",
+      default: "read-only",
+      options: [
+        { value: "read-only", label: t("settings_codexConfig_optReadOnly") },
+        { value: "workspace-write", label: t("settings_codexConfig_optWorkspaceWrite") },
+        { value: "danger-full-access", label: t("settings_codexConfig_optFullAccess") },
+      ],
+    },
+    {
+      key: "web_search",
+      label: t("settings_codexConfig_webSearchLabel"),
+      description: t("settings_codexConfig_webSearchDesc"),
+      group: "behavior",
+      type: "enum",
+      // Durable tri-state web search mode. The `cached` value is currently
+      // unreachable via the per-session --search boolean (which maps to live);
+      // this config key is the only way to select it.
+      default: "disabled",
+      options: [
+        { value: "disabled", label: t("settings_codexConfig_optDisabled") },
+        { value: "cached", label: t("settings_codexConfig_optCached") },
+        { value: "live", label: t("settings_codexConfig_optLive") },
+      ],
+    },
+  ];
+
+  function getCodexConfigValue(key: string, def: CliConfigSettingDef): unknown {
+    return key in codexConfig ? codexConfig[key] : def.default;
+  }
+
+  function isCodexProjectOverride(key: string): boolean {
+    return key in projectCodexConfig;
+  }
+
+  /** Render display for unknown/unrecognized values */
+  function codexValueDisplay(key: string, def: CliConfigSettingDef): string | null {
+    const val = codexConfig[key];
+    if (val === undefined || val === null) return null;
+    // If it's a table/object → custom table value
+    if (typeof val === "object" && !Array.isArray(val)) {
+      return t("settings_codexConfig_customTable");
+    }
+    // If it's an enum type and value doesn't match known options
+    if (def.type === "enum" && def.options) {
+      const known = def.options.some((o) => o.value === val);
+      if (!known && typeof val === "string") {
+        return t("settings_codexConfig_unrecognized", { value: val });
+      }
+    }
+    return null;
+  }
+
+  async function saveCodexConfigPatch(key: string, value: unknown) {
+    dbg("settings", "saveCodexConfigPatch", { key, value });
+    try {
+      codexConfig = await api.updateCodexConfig({ [key]: value ?? null });
+    } catch (e) {
+      dbgWarn("settings", "saveCodexConfigPatch error", e);
+    }
+  }
+
   function getCliConfigValue(key: string, def: CliConfigSettingDef): unknown {
     return key in cliConfig ? cliConfig[key] : def.default;
   }
@@ -770,16 +1136,29 @@
     cliConfigLoading = true;
     cliConfigError = "";
     try {
-      cliConfig = await api.getCliConfig();
-      // Load project config for override indicators
       const cwd = localStorage.getItem("ocv:project-cwd") || "";
-      if (cwd) {
-        projectCliConfig = await api.getProjectCliConfig(cwd);
-      }
+      // Load Claude + Codex configs in parallel
+      const [claudeConfig, codexResult, projectClaude, projectCodex] = await Promise.all([
+        api.getCliConfig(),
+        api.getCodexConfig(),
+        cwd ? api.getProjectCliConfig(cwd) : Promise.resolve({}),
+        cwd ? api.getProjectCodexConfig(cwd) : Promise.resolve({}),
+      ]);
+
+      cliConfig = claudeConfig;
+      projectCliConfig = projectClaude;
+
+      // Codex config with warning support
+      codexConfig = codexResult.config ?? {};
+      codexConfigWarning = codexResult.warning;
+      projectCodexConfig = projectCodex;
+
       cliConfigLoaded = true;
       dbg("settings", "cliConfig loaded", {
         keys: Object.keys(cliConfig).length,
         projectKeys: Object.keys(projectCliConfig).length,
+        codexKeys: Object.keys(codexConfig).length,
+        codexWarning: codexConfigWarning,
       });
     } catch (e) {
       cliConfigError = String(e);
@@ -1119,6 +1498,13 @@
     } catch (e) {
       dbgWarn("settings", "error", e);
     }
+    // Load Codex status + hooks + per-session agent settings
+    loadCodexStatus().then(() => {
+      if (codexStatus?.installed) {
+        loadCodexHooksCount();
+        loadCodexAgentSettings();
+      }
+    });
     // Load auth overview
     api
       .getAuthOverview()
@@ -1169,6 +1555,18 @@
       .catch(() => {
         cliSource = "defaults";
       });
+  });
+
+  // Cross-page sync: when in-chat /login or /logout finishes, the chat page
+  // dispatches `ocv:codex-auth-changed`. Refresh Codex status here so this
+  // Settings tab doesn't show stale auth state. Strictly one-way
+  // (chat → settings) to avoid double-refresh loops with handleCodexLogin.
+  onMount(() => {
+    const handler = () => {
+      void refreshCodexAll();
+    };
+    window.addEventListener("ocv:codex-auth-changed", handler);
+    return () => window.removeEventListener("ocv:codex-auth-changed", handler);
   });
 
   async function saveGeneralPatch(patch: Record<string, unknown>) {
@@ -1345,6 +1743,34 @@
     <!-- ═══ General tab ═══ -->
     {#if activeTab === "general"}
       <div class="space-y-6">
+        <!-- Default Agent Card -->
+        <Card class="p-6 space-y-4">
+          <h2 class="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
+            {t("settings_general_defaultAgent")}
+          </h2>
+          <div class="flex items-center justify-between gap-4">
+            <div>
+              <p class="text-sm font-medium">{t("settings_general_defaultAgentLabel")}</p>
+              <p class="text-xs text-muted-foreground">
+                {t("settings_general_defaultAgentDesc")}
+              </p>
+            </div>
+            <div class="flex gap-1.5">
+              {#each ["claude", "codex"] as ag (ag)}
+                <button
+                  class="rounded-md border px-3 py-1.5 text-xs capitalize transition-all duration-150
+                  {(settings?.default_agent ?? 'claude') === ag
+                    ? 'bg-primary text-primary-foreground'
+                    : 'hover:bg-accent'}"
+                  onclick={() => saveGeneralPatch({ default_agent: ag })}
+                >
+                  {ag}
+                </button>
+              {/each}
+            </div>
+          </div>
+        </Card>
+
         <!-- Language Card -->
         <Card class="p-6 space-y-4">
           <h2 class="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
@@ -1864,11 +2290,11 @@
       <!-- ═══ Connection tab ═══ -->
     {:else if activeTab === "connection"}
       <div class="space-y-6">
-        <!-- Authentication -->
+        <!-- Claude authentication -->
         <Card class="p-6 space-y-5">
           <div class="flex items-center justify-between">
             <h2 class="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
-              {t("settings_general_connection")}
+              {t("settings_connection_claudeTitle")}
             </h2>
             {#if generalSaved}
               <span class="text-xs text-emerald-500 flex items-center gap-1 animate-fade-in">
@@ -2096,81 +2522,93 @@
                 >
                 <!-- Platform grid (always visible) -->
                 <div class="grid grid-cols-4 gap-1.5">
-                  {#each platformList.filter((p) => p.id !== "custom") as preset}
-                    <button
-                      class="flex flex-col gap-0 rounded-md p-2 text-left transition-colors relative group
-                      {selectedPlatformId === preset.id
-                        ? 'bg-primary/10 ring-1 ring-primary'
-                        : 'bg-muted/40 hover:bg-muted/70'}"
-                      onclick={() => applyPlatformPreset(preset)}
+                  {#each groupedPlatforms as group}
+                    <div
+                      class="col-span-4 px-1 pt-2 pb-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/60"
                     >
-                      <span class="text-xs font-medium truncate">{preset.name}</span>
-                      <span class="text-[10px] text-muted-foreground truncate"
-                        >{preset.description}</span
+                      {group.label}
+                    </div>
+                    {#each group.items as preset}
+                      <button
+                        class="flex items-center gap-2 rounded-md p-2 text-left transition-colors relative group
+                      {selectedPlatformId === preset.id
+                          ? 'bg-primary/10 ring-1 ring-primary'
+                          : 'bg-muted/40 hover:bg-muted/70'}"
+                        onclick={() => applyPlatformPreset(preset)}
                       >
-                      {#if isCustomPlatform(preset.id)}
-                        <span
-                          role="button"
-                          tabindex="0"
-                          class="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive transition-all p-0.5 cursor-pointer"
-                          onclick={(e: MouseEvent) => {
-                            e.stopPropagation();
-                            deleteCustomEndpoint(preset.id);
-                          }}
-                          onkeydown={(e: KeyboardEvent) => {
-                            if (e.key === "Enter" || e.key === " ") {
-                              e.stopPropagation();
-                              deleteCustomEndpoint(preset.id);
-                            }
-                          }}
-                          title={t("settings_general_deleteCustom")}
-                        >
-                          <svg
-                            class="h-3 w-3"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            stroke-width="2"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg
+                        <ProviderIcon id={preset.id} name={preset.name} />
+                        <span class="flex flex-col min-w-0 flex-1">
+                          <span class="text-xs font-medium truncate">{preset.name}</span>
+                          <span class="text-[10px] text-muted-foreground truncate"
+                            >{preset.description}</span
                           >
                         </span>
-                      {/if}
-                      {#if preset.category === "local"}
-                        {@const ps = localProxyStatuses[preset.id]}
-                        <span
-                          class="absolute bottom-1 right-1 h-1.5 w-1.5 rounded-full {ps?.running &&
-                          !ps.needsAuth
-                            ? 'bg-green-500'
-                            : ps?.running && ps.needsAuth
-                              ? 'bg-amber-500'
-                              : 'bg-muted-foreground/30'}"
-                          title={ps?.running && !ps.needsAuth
-                            ? t("settings_local_running")
-                            : ps?.running && ps.needsAuth
-                              ? t("settings_local_needsAuth")
-                              : t("settings_local_notDetected")}
-                        ></span>
-                      {:else if findCredential(platformCredentials, preset.id)?.api_key}
-                        <span
-                          class="absolute bottom-1 right-1 h-1.5 w-1.5 rounded-full bg-green-500"
-                          title="Key saved"
-                        ></span>
-                      {/if}
-                    </button>
+                        {#if isCustomPlatform(preset.id)}
+                          <span
+                            role="button"
+                            tabindex="0"
+                            class="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive transition-all p-0.5 cursor-pointer"
+                            onclick={(e: MouseEvent) => {
+                              e.stopPropagation();
+                              deleteCustomEndpoint(preset.id);
+                            }}
+                            onkeydown={(e: KeyboardEvent) => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.stopPropagation();
+                                deleteCustomEndpoint(preset.id);
+                              }
+                            }}
+                            title={t("settings_general_deleteCustom")}
+                          >
+                            <svg
+                              class="h-3 w-3"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="2"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg
+                            >
+                          </span>
+                        {/if}
+                        {#if preset.category === "local"}
+                          {@const ps = localProxyStatuses[preset.id]}
+                          <span
+                            class="absolute bottom-1 right-1 h-1.5 w-1.5 rounded-full {ps?.running &&
+                            !ps.needsAuth
+                              ? 'bg-green-500'
+                              : ps?.running && ps.needsAuth
+                                ? 'bg-amber-500'
+                                : 'bg-muted-foreground/30'}"
+                            title={ps?.running && !ps.needsAuth
+                              ? t("settings_local_running")
+                              : ps?.running && ps.needsAuth
+                                ? t("settings_local_needsAuth")
+                                : t("settings_local_notDetected")}
+                          ></span>
+                        {:else if findCredential(platformCredentials, preset.id)?.api_key}
+                          <span
+                            class="absolute bottom-1 right-1 h-1.5 w-1.5 rounded-full bg-green-500"
+                            title="Key saved"
+                          ></span>
+                        {/if}
+                      </button>
+                    {/each}
+                    {#if group.id === "custom"}
+                      <!-- Add Custom -->
+                      <button
+                        class="flex flex-col items-center justify-center gap-1 rounded-md border border-dashed border-muted-foreground/30 p-2 text-muted-foreground hover:border-primary/50 hover:text-foreground hover:bg-muted/40 transition-colors"
+                        onclick={() => addCustomEndpoint()}
+                      >
+                        <svg
+                          class="h-4 w-4"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2"><path d="M12 5v14" /><path d="M5 12h14" /></svg
+                        >
+                        <span class="text-[10px]">{t("settings_general_addCustom")}</span>
+                      </button>
+                    {/if}
                   {/each}
-                  <!-- Add Custom -->
-                  <button
-                    class="flex flex-col items-center justify-center gap-1 rounded-md border border-dashed border-muted-foreground/30 p-2 text-muted-foreground hover:border-primary/50 hover:text-foreground hover:bg-muted/40 transition-colors"
-                    onclick={() => addCustomEndpoint()}
-                  >
-                    <svg
-                      class="h-4 w-4"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2"><path d="M12 5v14" /><path d="M5 12h14" /></svg
-                    >
-                    <span class="text-[10px]">{t("settings_general_addCustom")}</span>
-                  </button>
                 </div>
               </div>
 
@@ -2581,6 +3019,443 @@
           {/if}
         </Card>
 
+        <!-- Codex Status -->
+        <Card class="p-6 space-y-4">
+          <div class="flex items-center justify-between">
+            <h2 class="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
+              {t("settings_codex_title")}
+            </h2>
+            <button
+              class="text-xs text-muted-foreground hover:text-foreground transition-colors"
+              onclick={refreshCodexAll}
+            >
+              {t("settings_codex_refresh")}
+            </button>
+          </div>
+
+          {#if codexStatusLoading}
+            <div class="flex items-center gap-2">
+              <div
+                class="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent"
+              ></div>
+              <span class="text-sm text-muted-foreground">{t("settings_codex_checking")}</span>
+            </div>
+          {:else if !codexStatus}
+            <p class="text-sm text-muted-foreground">{t("settings_codex_checkFailed")}</p>
+          {:else if !codexStatus.installed}
+            <div class="flex items-center gap-3">
+              <div class="flex h-8 w-8 items-center justify-center rounded-full bg-red-500/10">
+                <svg
+                  class="h-4 w-4 text-red-400"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <circle cx="12" cy="12" r="10" /><line x1="15" y1="9" x2="9" y2="15" /><line
+                    x1="9"
+                    y1="9"
+                    x2="15"
+                    y2="15"
+                  />
+                </svg>
+              </div>
+              <div>
+                <p class="text-sm font-medium">{t("settings_codex_notInstalled")}</p>
+                <p class="text-xs text-muted-foreground">
+                  {t("settings_codex_installHint", { command: "npm i -g @openai/codex" })}
+                </p>
+              </div>
+            </div>
+          {:else}
+            <div class="space-y-3">
+              <!-- Version -->
+              <div class="flex items-center gap-3">
+                <div
+                  class="flex h-8 w-8 items-center justify-center rounded-full bg-emerald-500/10"
+                >
+                  <svg
+                    class="h-4 w-4 text-emerald-400"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  >
+                    <path d="M20 6 9 17l-5-5" />
+                  </svg>
+                </div>
+                <div>
+                  <p class="text-sm font-medium">{t("settings_codex_installed")}</p>
+                  {#if codexStatus.version}
+                    <p class="text-xs text-muted-foreground">v{codexStatus.version}</p>
+                  {/if}
+                </div>
+              </div>
+
+              <!-- codex doctor: richer install/config/auth/runtime/app-server diagnostics -->
+              <div class="rounded-lg border border-border/60 bg-card/40 p-3">
+                <div class="flex items-center justify-between gap-2">
+                  <div class="min-w-0">
+                    <p class="text-sm font-medium">{t("settings_codex_doctorTitle")}</p>
+                    <p class="text-xs text-muted-foreground">{t("settings_codex_doctorDesc")}</p>
+                  </div>
+                  <button
+                    class="shrink-0 rounded-md border border-border/60 px-2.5 py-1 text-xs font-medium hover:bg-accent disabled:opacity-50 transition-colors"
+                    disabled={codexDoctorLoading}
+                    onclick={runCodexDoctor}
+                  >
+                    {codexDoctorLoading ? t("common_loading") : t("settings_codex_doctorRun")}
+                  </button>
+                </div>
+                {#if codexDoctorError}
+                  <p class="mt-2 text-xs text-red-600 dark:text-red-400">{codexDoctorError}</p>
+                {/if}
+                {#if codexDoctor}
+                  <div class="mt-3 flex items-center gap-2 text-xs">
+                    <span
+                      class="rounded px-1.5 py-0.5 font-medium {doctorStatusClass(
+                        codexDoctor.overallStatus,
+                      )}">{codexDoctor.overallStatus}</span
+                    >
+                    <span class="text-muted-foreground">codex v{codexDoctor.codexVersion}</span>
+                  </div>
+                  <ul class="mt-2 space-y-1.5">
+                    {#each codexDoctorChecks as check (check.id)}
+                      <li class="flex items-start gap-2 text-xs">
+                        <span
+                          class="shrink-0 rounded px-1 py-0.5 text-[10px] font-medium {doctorStatusClass(
+                            check.status,
+                          )}">{check.status}</span
+                        >
+                        <div class="min-w-0">
+                          <span class="font-medium">{check.id}</span>
+                          <span class="text-muted-foreground"> — {check.summary}</span>
+                          {#if check.remediation}
+                            <p class="text-amber-600 dark:text-amber-400">{check.remediation}</p>
+                          {/if}
+                        </div>
+                      </li>
+                    {/each}
+                  </ul>
+                {/if}
+              </div>
+
+              <!-- Auth Mode selector: 2-way radio, mirroring Claude -->
+              <div>
+                <span class="text-sm font-medium mb-2 block">{t("settings_auth_modeLabel")}</span>
+                <div class="mt-1 grid grid-cols-2 gap-3">
+                  <button
+                    class="flex flex-col items-center gap-2 rounded-lg border p-4 text-sm transition-all duration-150
+                    {codexAuthMode === 'cli'
+                      ? 'border-primary bg-primary/5 ring-1 ring-primary/20'
+                      : 'hover:bg-accent hover:border-ring/30'}"
+                    onclick={() => setCodexAuthMode("cli")}
+                  >
+                    <div
+                      class="flex h-10 w-10 items-center justify-center rounded-full bg-emerald-500/10"
+                    >
+                      <svg
+                        class="h-5 w-5 text-emerald-400"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                      >
+                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path
+                          d="M7 11V7a5 5 0 0 1 10 0v4"
+                        />
+                      </svg>
+                    </div>
+                    <span class="font-medium">{t("auth_cliAuth")}</span>
+                    <span class="text-[10px] text-muted-foreground text-center"
+                      >{t("settings_codex_authModeCliDesc")}</span
+                    >
+                  </button>
+                  <button
+                    class="flex flex-col items-center gap-2 rounded-lg border p-4 text-sm transition-all duration-150
+                    {codexAuthMode === 'app'
+                      ? 'border-primary bg-primary/5 ring-1 ring-primary/20'
+                      : 'hover:bg-accent hover:border-ring/30'}"
+                    onclick={() => setCodexAuthMode("app")}
+                  >
+                    <div
+                      class="flex h-10 w-10 items-center justify-center rounded-full bg-violet-500/10"
+                    >
+                      <svg
+                        class="h-5 w-5 text-violet-400"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                      >
+                        <rect x="2" y="2" width="20" height="8" rx="2" ry="2" /><rect
+                          x="2"
+                          y="14"
+                          width="20"
+                          height="8"
+                          rx="2"
+                          ry="2"
+                        /><line x1="6" y1="6" x2="6.01" y2="6" /><line
+                          x1="6"
+                          y1="18"
+                          x2="6.01"
+                          y2="18"
+                        />
+                      </svg>
+                    </div>
+                    <span class="font-medium">{t("settings_codex_authModeProviderLabel")}</span>
+                    <span class="text-[10px] text-muted-foreground text-center"
+                      >{t("settings_codex_authModeProviderDesc")}</span
+                    >
+                  </button>
+                </div>
+              </div>
+
+              <!-- CLI Auth details (codex login owns auth in this mode) -->
+              {#if codexAuthMode === "cli"}
+                <div class="space-y-3 rounded-lg border border-border/50 p-4">
+                  <!-- Auth status -->
+                  <div class="flex items-center gap-3">
+                    {#if codexStatus.logged_in}
+                      <div
+                        class="flex h-8 w-8 items-center justify-center rounded-full bg-emerald-500/10"
+                      >
+                        <svg
+                          class="h-4 w-4 text-emerald-400"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        >
+                          <rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path
+                            d="M7 11V7a5 5 0 0 1 10 0v4"
+                          />
+                        </svg>
+                      </div>
+                      <div>
+                        <p class="text-sm font-medium">{t("settings_codex_loggedIn")}</p>
+                        <p class="text-xs text-muted-foreground">
+                          {codexStatus.auth_method === "chatgpt"
+                            ? t("settings_codex_authChatGPT")
+                            : codexStatus.auth_method === "api_key"
+                              ? t("settings_codex_authApiKey")
+                              : t("settings_codex_authGeneric")}
+                        </p>
+                      </div>
+                    {:else}
+                      <div
+                        class="flex h-8 w-8 items-center justify-center rounded-full bg-amber-500/10"
+                      >
+                        <svg
+                          class="h-4 w-4 text-amber-400"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        >
+                          <path
+                            d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"
+                          /><line x1="12" y1="9" x2="12" y2="13" /><line
+                            x1="12"
+                            y1="17"
+                            x2="12.01"
+                            y2="17"
+                          />
+                        </svg>
+                      </div>
+                      <div class="flex-1">
+                        <p class="text-sm font-medium">{t("settings_codex_notLoggedIn")}</p>
+                        {#if codexLoginError}
+                          <p class="text-xs text-red-400 mt-1">{codexLoginError}</p>
+                        {/if}
+                      </div>
+                      <button
+                        class="shrink-0 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
+                        disabled={codexLoginLoading}
+                        onclick={handleCodexLogin}
+                      >
+                        {codexLoginLoading
+                          ? t("settings_codex_loggingIn")
+                          : t("settings_codex_loginBtn")}
+                      </button>
+                    {/if}
+                  </div>
+                  <!-- codex login owns auth in this mode -->
+                  <p class="text-xs text-muted-foreground/80 pl-11">
+                    {t("settings_codex_authNote")}
+                  </p>
+                </div>
+              {/if}
+
+              <!-- Codex transport: app-server unlocks interactive tools -->
+              {#if settings}
+                <label
+                  class="flex items-start gap-3 rounded-lg border border-border/50 p-4 cursor-pointer hover:bg-accent/40"
+                >
+                  <input
+                    type="checkbox"
+                    class="mt-0.5 rounded"
+                    checked={settings.codex_transport !== "exec"}
+                    onchange={async (e) => {
+                      const on = (e.currentTarget as HTMLInputElement).checked;
+                      settings = await api.updateUserSettings({
+                        codex_transport: on ? "app_server" : "exec",
+                      } as Partial<UserSettings>);
+                    }}
+                  />
+                  <span>
+                    <span class="font-medium text-sm">{t("settings_codexTransport_label")}</span>
+                    <span class="block text-xs text-muted-foreground mt-0.5"
+                      >{t("settings_codexTransport_desc")}</span
+                    >
+                  </span>
+                </label>
+              {/if}
+
+              <!-- App Provider details: point Codex at a third-party Responses provider -->
+              {#if codexAuthMode === "app"}
+                <div class="space-y-3 rounded-lg border border-border/50 p-4">
+                  <p class="text-xs text-muted-foreground">
+                    {t("settings_codexProvider_desc")}
+                  </p>
+                  <!-- Provider grid. No "None" tile — CLI Auth above already is None. -->
+                  <div class="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                    {#each CODEX_PROVIDER_PRESETS as preset (preset.id)}
+                      <button
+                        class="rounded-md border p-3 text-left transition-colors
+                          {codexProviderId === preset.id
+                          ? 'border-primary bg-primary/5'
+                          : 'hover:bg-accent hover:border-ring/30'}"
+                        onclick={() => selectCodexProvider(preset)}
+                      >
+                        <p class="text-sm font-medium truncate">{preset.name}</p>
+                        <p class="text-xs text-muted-foreground mt-0.5 truncate">
+                          {preset.description}
+                        </p>
+                      </button>
+                    {/each}
+                  </div>
+
+                  {#if codexProviderPreset}
+                    <div class="space-y-3 rounded-md border border-border/60 p-4">
+                      <!-- Base URL (editable for custom, shown read-only otherwise) -->
+                      <div>
+                        <span class="text-xs font-medium text-muted-foreground">Base URL</span>
+                        {#if codexProviderPreset.custom}
+                          <input
+                            class="mt-1 w-full rounded-md border px-3 py-2 text-sm bg-background font-mono"
+                            placeholder="https://host/v1"
+                            bind:value={codexProviderBaseUrl}
+                          />
+                        {:else}
+                          <p class="text-xs font-mono text-muted-foreground mt-1">
+                            {codexProviderBaseUrl || codexProviderPreset.base_url}
+                          </p>
+                        {/if}
+                      </div>
+
+                      <!-- Model -->
+                      <div>
+                        <span class="text-xs font-medium text-muted-foreground"
+                          >{t("settings_codexProvider_model")}</span
+                        >
+                        <input
+                          class="mt-1 w-full rounded-md border px-3 py-2 text-sm bg-background font-mono"
+                          placeholder="gpt-5.1"
+                          bind:value={codexProviderModel}
+                        />
+                      </div>
+
+                      <!-- API key (skipped for keyless local providers) -->
+                      {#if !codexProviderPreset.keyless}
+                        <div>
+                          <span class="text-xs font-medium text-muted-foreground"
+                            >{t("settings_codexProvider_apiKey")}</span
+                          >
+                          <input
+                            type="password"
+                            class="mt-1 w-full rounded-md border px-3 py-2 text-sm bg-background font-mono"
+                            placeholder={codexProviderPreset.key_placeholder}
+                            bind:value={codexProviderKey}
+                          />
+                          <p class="text-[11px] text-muted-foreground/70 mt-1">
+                            {t("settings_codexProvider_keyEnvNote", {
+                              env: codexProviderPreset.env_key,
+                            })}
+                          </p>
+                        </div>
+                      {/if}
+
+                      <div class="flex justify-end">
+                        <button
+                          class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+                          onclick={() => saveCodexProvider()}
+                        >
+                          {t("settings_codexProvider_save")}
+                        </button>
+                      </div>
+                    </div>
+                  {/if}
+                </div>
+              {/if}
+
+              <!-- Pointer: Codex model/sandbox config lives in the CLI Config tab, not here -->
+              <p class="text-xs text-muted-foreground/80">
+                {t("settings_codex_modelHint")}
+              </p>
+              <!-- Codex Hooks shortcut -->
+              {#if codexHooksCount !== null}
+                <div class="flex items-center gap-3 pt-3 border-t border-border/50">
+                  <div class="flex h-8 w-8 items-center justify-center rounded-full bg-muted">
+                    <svg
+                      class="h-4 w-4 text-muted-foreground"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                    >
+                      <path d="M18 8h1a4 4 0 0 1 0 8h-1" /><path
+                        d="M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z"
+                      /><line x1="6" y1="1" x2="6" y2="4" /><line
+                        x1="10"
+                        y1="1"
+                        x2="10"
+                        y2="4"
+                      /><line x1="14" y1="1" x2="14" y2="4" />
+                    </svg>
+                  </div>
+                  <div class="flex-1">
+                    <p class="text-sm font-medium">{t("settings_codexHooks_label")}</p>
+                    <p class="text-xs text-muted-foreground">
+                      {t("settings_codexHooks_count", { count: String(codexHooksCount) })}
+                    </p>
+                  </div>
+                  <button
+                    class="text-xs text-primary hover:underline"
+                    onclick={() => goto("/plugins?section=hooks")}
+                  >
+                    {t("settings_codexHooks_manage")}
+                  </button>
+                </div>
+              {/if}
+            </div>
+          {/if}
+        </Card>
+
         <!-- Setup Wizard button -->
         <div class="flex items-center justify-between rounded-lg border border-border p-4">
           <div>
@@ -2620,6 +3495,12 @@
         </Card>
       {:else}
         <div class="space-y-6">
+          <!-- Claude group -->
+          <h2
+            class="text-xs font-semibold text-muted-foreground/60 uppercase tracking-widest pt-1 border-b border-border/40 pb-2"
+          >
+            {t("settings_cliConfig_claudeGroup")}
+          </h2>
           <!-- Behavior -->
           <Card class="p-6 space-y-4">
             <h2 class="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
@@ -2844,6 +3725,267 @@
           <p class="text-[10px] text-muted-foreground px-1">
             {t("settings_cliConfig_footer")}
           </p>
+
+          <!-- Codex group -->
+          <h2
+            class="text-xs font-semibold text-muted-foreground/60 uppercase tracking-widest pt-3 border-b border-border/40 pb-2"
+          >
+            {t("settings_cliConfig_codexGroup")}
+          </h2>
+
+          <!-- ── Codex Config ── -->
+          <Card class="p-6 space-y-4">
+            <h2 class="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
+              {t("settings_codexConfig_title")}
+            </h2>
+
+            {#if codexConfigWarning}
+              <div
+                class="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2"
+              >
+                <svg
+                  class="h-4 w-4 text-amber-400 shrink-0 mt-0.5"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  stroke-width="2"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
+                  />
+                </svg>
+                <div class="text-xs text-amber-300">
+                  <p>{t("settings_codexConfig_warning", { warning: codexConfigWarning })}</p>
+                  <p class="mt-0.5 text-amber-400/70">
+                    {t("settings_codexConfig_warningDisabled")}
+                  </p>
+                </div>
+              </div>
+            {/if}
+
+            {#each CODEX_CONFIG_SETTINGS as def (def.key)}
+              {@const unknownDisplay = codexValueDisplay(def.key, def)}
+              <div class="flex items-center justify-between gap-4 py-1">
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-center gap-2">
+                    <p class="text-sm font-medium">{def.label}</p>
+                    {#if isCodexProjectOverride(def.key)}
+                      <span
+                        class="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium bg-amber-500/15 text-amber-400 border border-amber-500/20"
+                      >
+                        {t("settings_codexConfig_projectOverrideApprox")}
+                      </span>
+                    {/if}
+                  </div>
+                  <p class="text-xs text-muted-foreground mt-0.5">{def.description}</p>
+                </div>
+                {#if def.type === "enum" && def.options}
+                  <div class="flex items-center gap-1.5 shrink-0">
+                    {#each def.options as opt (opt.value)}
+                      <button
+                        class="rounded-md border px-3 py-1.5 text-xs transition-all duration-150
+                        {getCodexConfigValue(def.key, def) === opt.value
+                          ? 'bg-primary text-primary-foreground'
+                          : 'hover:bg-accent hover:border-ring/30'}
+                        {codexConfigWarning ? 'opacity-50 cursor-not-allowed' : ''}"
+                        disabled={!!codexConfigWarning}
+                        onclick={() => {
+                          saveCodexConfigPatch(def.key, opt.value);
+                          codexConfig = { ...codexConfig, [def.key]: opt.value };
+                        }}
+                      >
+                        {opt.label}
+                      </button>
+                    {/each}
+                    {#if unknownDisplay}
+                      <span class="text-[10px] text-amber-400 ml-1">{unknownDisplay}</span>
+                    {/if}
+                  </div>
+                {:else if def.type === "string"}
+                  <input
+                    class="w-40 shrink-0 rounded-md border bg-transparent px-3 py-1.5 text-sm placeholder:text-muted-foreground focus:border-ring focus:outline-none
+                    {codexConfigWarning ? 'opacity-50 cursor-not-allowed' : ''}"
+                    disabled={!!codexConfigWarning}
+                    value={getCodexConfigValue(def.key, def) ?? ""}
+                    placeholder={t("settings_codexConfig_modelPlaceholder")}
+                    onblur={(e) => {
+                      const val = (e.target as HTMLInputElement).value.trim();
+                      if (val) {
+                        saveCodexConfigPatch(def.key, val);
+                        codexConfig = { ...codexConfig, [def.key]: val };
+                      } else {
+                        saveCodexConfigPatch(def.key, null);
+                        const next = { ...codexConfig };
+                        delete next[def.key];
+                        codexConfig = next;
+                      }
+                    }}
+                  />
+                {/if}
+              </div>
+            {/each}
+          </Card>
+
+          <!-- Codex footer note -->
+          <p class="text-[10px] text-muted-foreground px-1">
+            {t("settings_codexConfig_footer")}
+          </p>
+
+          <!-- Codex per-session flags (OpenCovibe layer, overrides config.toml) -->
+          {#if codexAgentSettings}
+            <Card class="p-5 space-y-4">
+              <div class="flex items-center justify-between gap-2">
+                <div>
+                  <h3 class="text-sm font-semibold">
+                    {t("settings_codexFlags_title")}
+                  </h3>
+                  <p class="text-xs text-muted-foreground mt-0.5">
+                    {t("settings_codexFlags_subtitle")}
+                  </p>
+                </div>
+              </div>
+
+              <!-- Reasoning effort (per-session override) -->
+              <div class="flex items-center justify-between gap-4 py-1">
+                <div class="flex-1 min-w-0">
+                  <p class="text-sm font-medium">{t("settings_codexFlags_effortLabel")}</p>
+                  <p class="text-xs text-muted-foreground mt-0.5">
+                    {t("settings_codexFlags_effortDesc")}
+                  </p>
+                </div>
+                <div class="flex items-center gap-1.5 shrink-0 flex-wrap">
+                  {#each [{ val: "", labelKey: "settings_codexConfig_optInherit" }, { val: "none", labelKey: "settings_codexConfig_optNone" }, { val: "minimal", labelKey: "settings_codexConfig_optMinimal" }, { val: "low", labelKey: "settings_codexConfig_optLow" }, { val: "medium", labelKey: "settings_codexConfig_optMedium" }, { val: "high", labelKey: "settings_codexConfig_optHigh" }, { val: "xhigh", labelKey: "settings_codexConfig_optXHigh" }] as opt (opt.val)}
+                    <button
+                      class="rounded-md border px-3 py-1.5 text-xs transition-all duration-150
+                        {(codexAgentSettings.effort ?? '') === opt.val
+                        ? 'bg-primary text-primary-foreground'
+                        : 'hover:bg-accent hover:border-ring/30'}"
+                      onclick={() =>
+                        saveCodexAgentPatch({
+                          effort: opt.val === "" ? null : opt.val,
+                        } as Partial<AgentSettings>)}
+                    >
+                      {t(opt.labelKey as Parameters<typeof t>[0])}
+                    </button>
+                  {/each}
+                </div>
+              </div>
+
+              <!-- Profile -->
+              <div class="flex items-center justify-between gap-4 py-1">
+                <div class="flex-1 min-w-0">
+                  <p class="text-sm font-medium">{t("settings_codexFlags_profileLabel")}</p>
+                  <p class="text-xs text-muted-foreground mt-0.5">
+                    {t("settings_codexFlags_profileDesc")}
+                  </p>
+                </div>
+                <input
+                  class="w-40 shrink-0 rounded-md border bg-transparent px-3 py-1.5 text-sm placeholder:text-muted-foreground focus:border-ring focus:outline-none"
+                  value={codexAgentSettings.profile ?? ""}
+                  placeholder={t("settings_codexFlags_profilePlaceholder")}
+                  onblur={(e) => {
+                    const val = (e.target as HTMLInputElement).value.trim();
+                    saveCodexAgentPatch({ profile: val });
+                  }}
+                />
+              </div>
+
+              <!-- Ephemeral toggle -->
+              <div class="flex items-center justify-between gap-4 py-1">
+                <div class="flex-1 min-w-0">
+                  <p class="text-sm font-medium">{t("settings_codexFlags_ephemeralLabel")}</p>
+                  <p class="text-xs text-muted-foreground mt-0.5">
+                    {t("settings_codexFlags_ephemeralDesc")}
+                  </p>
+                </div>
+                <button
+                  class="rounded-md border px-3 py-1.5 text-xs shrink-0 transition-all
+                    {codexAgentSettings.ephemeral
+                    ? 'bg-primary text-primary-foreground'
+                    : 'hover:bg-accent hover:border-ring/30'}"
+                  onclick={() => saveCodexAgentPatch({ ephemeral: !codexAgentSettings?.ephemeral })}
+                >
+                  {codexAgentSettings.ephemeral
+                    ? t("settings_codexFlags_on")
+                    : t("settings_codexFlags_off")}
+                </button>
+              </div>
+
+              <!-- Ignore user config -->
+              <div class="flex items-center justify-between gap-4 py-1">
+                <div class="flex-1 min-w-0">
+                  <p class="text-sm font-medium">
+                    {t("settings_codexFlags_ignoreUserConfigLabel")}
+                  </p>
+                  <p class="text-xs text-amber-400/80 mt-0.5">
+                    {t("settings_codexFlags_ignoreUserConfigDesc")}
+                  </p>
+                </div>
+                <button
+                  class="rounded-md border px-3 py-1.5 text-xs shrink-0 transition-all
+                    {codexAgentSettings.ignore_user_config
+                    ? 'bg-primary text-primary-foreground'
+                    : 'hover:bg-accent hover:border-ring/30'}"
+                  onclick={() =>
+                    saveCodexAgentPatch({
+                      ignore_user_config: !codexAgentSettings?.ignore_user_config,
+                    })}
+                >
+                  {codexAgentSettings.ignore_user_config
+                    ? t("settings_codexFlags_on")
+                    : t("settings_codexFlags_off")}
+                </button>
+              </div>
+
+              <!-- Ignore rules -->
+              <div class="flex items-center justify-between gap-4 py-1">
+                <div class="flex-1 min-w-0">
+                  <p class="text-sm font-medium">
+                    {t("settings_codexFlags_ignoreRulesLabel")}
+                  </p>
+                  <p class="text-xs text-amber-400/80 mt-0.5">
+                    {t("settings_codexFlags_ignoreRulesDesc")}
+                  </p>
+                </div>
+                <button
+                  class="rounded-md border px-3 py-1.5 text-xs shrink-0 transition-all
+                    {codexAgentSettings.ignore_rules
+                    ? 'bg-primary text-primary-foreground'
+                    : 'hover:bg-accent hover:border-ring/30'}"
+                  onclick={() =>
+                    saveCodexAgentPatch({ ignore_rules: !codexAgentSettings?.ignore_rules })}
+                >
+                  {codexAgentSettings.ignore_rules
+                    ? t("settings_codexFlags_on")
+                    : t("settings_codexFlags_off")}
+                </button>
+              </div>
+
+              <!-- Web search -->
+              <div class="flex items-center justify-between gap-4 py-1">
+                <div class="flex-1 min-w-0">
+                  <p class="text-sm font-medium">{t("settings_codexFlags_webSearchLabel")}</p>
+                  <p class="text-xs text-muted-foreground mt-0.5">
+                    {t("settings_codexFlags_webSearchDesc")}
+                  </p>
+                </div>
+                <button
+                  class="rounded-md border px-3 py-1.5 text-xs shrink-0 transition-all
+                    {codexAgentSettings.web_search
+                    ? 'bg-primary text-primary-foreground'
+                    : 'hover:bg-accent hover:border-ring/30'}"
+                  onclick={() =>
+                    saveCodexAgentPatch({ web_search: !codexAgentSettings?.web_search })}
+                >
+                  {codexAgentSettings.web_search
+                    ? t("settings_codexFlags_on")
+                    : t("settings_codexFlags_off")}
+                </button>
+              </div>
+            </Card>
+          {/if}
         </div>
       {/if}
 
@@ -2942,6 +4084,42 @@
           {/if}
         </Card>
 
+        <!-- Codex CLI shortcuts (collapsible, read-only) -->
+        <Card class="p-6 space-y-4">
+          <button
+            class="flex items-center gap-2 text-sm font-semibold text-muted-foreground uppercase tracking-wider hover:text-foreground transition-colors w-full"
+            onclick={() => (codexCliSectionOpen = !codexCliSectionOpen)}
+          >
+            <svg
+              class="h-3 w-3 transition-transform {codexCliSectionOpen ? 'rotate-90' : ''}"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg
+            >
+            {t("settings_shortcuts_codexCliShortcuts")}
+            <span class="text-[10px] font-normal normal-case tracking-normal text-muted-foreground"
+              >{t("settings_shortcuts_readOnly")}</span
+            >
+          </button>
+          {#if codexCliSectionOpen}
+            <div class="divide-y divide-border/50">
+              {#each codexCliBindings as binding (binding.command)}
+                <div class="flex items-center gap-3 py-1.5">
+                  <span class="text-sm text-foreground/60 min-w-[140px]">{binding.label}</span>
+                  <span
+                    class="inline-flex items-center rounded-md border bg-muted/30 px-2.5 py-1 text-xs font-mono text-muted-foreground min-w-[60px] justify-center"
+                  >
+                    {formatKeyDisplay(binding.key)}
+                  </span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </Card>
+
         <!-- Reset all -->
         {#if hasOverrides}
           <div class="flex justify-end">
@@ -2979,6 +4157,29 @@
               {t("settings_general_saved")}
             </span>
           {/if}
+        </div>
+
+        <!-- Claude-only notice: Codex has no remote-SSH support -->
+        <div
+          class="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2"
+        >
+          <svg
+            class="h-4 w-4 shrink-0 text-amber-400 mt-0.5"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line
+              x1="12"
+              y1="16"
+              x2="12.01"
+              y2="16"
+            />
+          </svg>
+          <p class="text-xs text-amber-200/90">{t("settings_remote_claudeOnly")}</p>
         </div>
 
         <!-- Existing hosts list -->

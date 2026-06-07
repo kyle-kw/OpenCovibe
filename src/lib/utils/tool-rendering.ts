@@ -145,6 +145,8 @@ const FRIENDLY_TOOL_NAMES: Record<string, string> = {
   Grep: "Search content",
   WebFetch: "Fetch URLs",
   WebSearch: "Search web",
+  // Upstream renamed the subagent tool Task → Agent; keep Task for legacy run replay.
+  Agent: "Run sub-agent",
   Task: "Run sub-agent",
   NotebookEdit: "Edit notebook",
   PowerShell: "Run PowerShell",
@@ -158,6 +160,12 @@ const FRIENDLY_TOOL_NAMES: Record<string, string> = {
 /** Map a tool name to a human-readable description. Falls back to the original name. */
 export function friendlyToolName(name: string): string {
   return FRIENDLY_TOOL_NAMES[name] ?? name;
+}
+
+/** Single source of truth for the subagent-spawn tool name.
+ *  Upstream renamed Task → Agent; "Task" is kept only for replay of legacy stored runs. */
+export function isSubagentTool(name: string): boolean {
+  return name === "Agent" || name === "Task";
 }
 
 /**
@@ -268,13 +276,13 @@ export function detectBatchGroups(
   let i = 0;
   while (i < timeline.length) {
     const entry = timeline[i];
-    if (entry.kind === "tool" && entry.tool?.tool_name === "Task") {
+    if (entry.kind === "tool" && isSubagentTool(entry.tool?.tool_name ?? "")) {
       const start = i;
       const tools: BusToolItem[] = [];
       while (
         i < timeline.length &&
         timeline[i].kind === "tool" &&
-        timeline[i].tool?.tool_name === "Task"
+        isSubagentTool(timeline[i].tool?.tool_name ?? "")
       ) {
         tools.push(timeline[i].tool!);
         i++;
@@ -300,7 +308,14 @@ export interface ToolBurst {
   stats: { completed: number; failed: number; running: number; total: number };
 }
 
-const BURST_EXCLUDE = new Set(["Task", "AskUserQuestion", "ExitPlanMode", "EnterPlanMode"]);
+// Agent/Task (subagent) excluded — they own a subTimeline and must not collapse into a burst.
+const BURST_EXCLUDE = new Set([
+  "Agent",
+  "Task",
+  "AskUserQuestion",
+  "ExitPlanMode",
+  "EnterPlanMode",
+]);
 
 /**
  * Detect "tool burst" segments: consecutive tool entries (regardless of tool_name)
@@ -569,7 +584,7 @@ const LEVEL_2_TOOLS = new Set(["Bash", "bash", "Edit", "edit_file", "Write", "wr
 export function getToolRenderLevel(toolName: string, status: BusToolItem["status"]): 1 | 2 | 3 {
   // AskUserQuestion is always Level 3 (all states: active, done, denied)
   if (toolName === "AskUserQuestion") return 3;
-  // Interactive statuses: user must approve/deny
+  // Interactive statuses: user must approve/deny (also covers ExitPlanMode plan approval)
   if (status === "permission_prompt") return 3;
   // Output-focused tools (including cross-provider aliases)
   if (LEVEL_2_TOOLS.has(toolName)) return 2;
@@ -581,13 +596,37 @@ export function getToolRenderLevel(toolName: string, status: BusToolItem["status
 
 import type { PermissionSuggestion } from "$lib/types";
 
+/** Tool names whose tool_end updates scheduledTasks state. */
+export const SCHEDULING_TOOLS = new Set(["CronCreate", "CronDelete"]);
+
+/** First defined string value at any of the keys in `input`. */
+function pickString(
+  input: Record<string, unknown> | undefined,
+  keys: readonly string[],
+): string | undefined {
+  if (!input) return undefined;
+  for (const k of keys) {
+    const v = input[k];
+    if (typeof v === "string" && v.length > 0) return v;
+  }
+  return undefined;
+}
+
+/** Cron-expression field on CronCreate input (CLI naming has drifted historically). */
+export function pickSchedule(input: Record<string, unknown> | undefined): string | undefined {
+  return pickString(input, ["cron", "schedule", "expression"]);
+}
+
+/** Cron-task id field on CronDelete input (CLI naming has drifted historically). */
+export function pickCronId(input: Record<string, unknown> | undefined): string | undefined {
+  return pickString(input, ["id", "task_id", "cronId"]);
+}
+
 /** Extract a human-readable detail string from tool input (file path, command, pattern, etc.). */
 export function getToolDetail(input: Record<string, unknown> | undefined): string {
   if (!input || Object.keys(input).length === 0) return "";
-  // Scheduling tools: show schedule + prompt so cadence is visible (otherwise
-  // the prompt-only fallback hides cron expression).
-  const schedule = (input.cron ?? input.schedule ?? input.expression) as string | undefined;
-  if (typeof schedule === "string" && schedule.length > 0) {
+  const schedule = pickSchedule(input);
+  if (schedule) {
     const prompt = typeof input.prompt === "string" ? input.prompt : "";
     return prompt ? `${schedule} — ${prompt}` : schedule;
   }

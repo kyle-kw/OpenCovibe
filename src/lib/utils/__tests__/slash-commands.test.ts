@@ -9,6 +9,7 @@ import {
   mergeWithVirtual,
   isVirtualCommand,
   parseVirtualAction,
+  getKnownVirtualNames,
   getQuickActions,
   classifyCloseReason,
   getCommandCategory,
@@ -245,21 +246,25 @@ describe("mergeWithVirtual", () => {
   it("appends virtual commands to CLI commands", () => {
     const cli: CliCommand[] = [{ name: "compact", description: "Compact", aliases: [] }];
     const merged = mergeWithVirtual(cli);
-    expect(merged.length).toBe(1 + VIRTUAL_COMMANDS.length);
-    // All virtual commands are appended (order matches VIRTUAL_COMMANDS)
+    // Default agent is "claude" — exclude virtuals gated against Claude.
+    const applicableVirtuals = VIRTUAL_COMMANDS.filter(
+      (v) => !((v as { _excludeAgents?: string[] })._excludeAgents ?? []).includes("claude"),
+    );
+    expect(merged.length).toBe(1 + applicableVirtuals.length);
     const appended = merged.slice(1);
-    expect(appended.map((c) => c.name)).toEqual(VIRTUAL_COMMANDS.map((v) => v.name));
+    expect(appended.map((c) => c.name)).toEqual(applicableVirtuals.map((v) => v.name));
   });
 
   it("merges virtual metadata onto CLI command with same name", () => {
     const cli: CliCommand[] = [{ name: "model", description: "CLI model", aliases: [] }];
     const merged = mergeWithVirtual(cli);
-    // 1 merged (model) + remaining virtuals not in CLI
-    const novelVirtuals = VIRTUAL_COMMANDS.filter((v) => v.name !== "model").length;
+    const novelVirtuals = VIRTUAL_COMMANDS.filter(
+      (v) =>
+        v.name !== "model" &&
+        !((v as { _excludeAgents?: string[] })._excludeAgents ?? []).includes("claude"),
+    ).length;
     expect(merged.length).toBe(1 + novelVirtuals);
-    // CLI description takes priority over empty virtual description
     expect(merged[0].description).toBe("CLI model");
-    // Virtual metadata is injected
     expect(merged[0]["_virtual"]).toBe(true);
     expect(merged[0]["_enum"]).toBe(true);
   });
@@ -280,7 +285,11 @@ describe("mergeWithVirtual", () => {
 
   it("returns only virtuals when CLI list is empty", () => {
     const merged = mergeWithVirtual([]);
-    expect(merged.length).toBe(VIRTUAL_COMMANDS.length);
+    // Default agent "claude" — `init` virtual is gated to Codex.
+    const applicable = VIRTUAL_COMMANDS.filter(
+      (v) => !((v as { _excludeAgents?: string[] })._excludeAgents ?? []).includes("claude"),
+    );
+    expect(merged.length).toBe(applicable.length);
     expect(merged.every((c) => c["_virtual"] === true)).toBe(true);
   });
 
@@ -319,6 +328,129 @@ describe("mergeWithVirtual", () => {
     const cmd = merged.find((c) => c.name === "my-custom-skill");
     expect(cmd?.description).toBe("");
   });
+
+  // ── Codex P1 agent filtering ──
+
+  it("excludes /ralph and /cancel-ralph for Codex agent", () => {
+    const merged = mergeWithVirtual([], "codex");
+    const names = merged.map((c) => c.name);
+    expect(names).not.toContain("ralph");
+    expect(names).not.toContain("cancel-ralph");
+    // sanity: still includes commands valid for both agents
+    expect(names).toContain("copy");
+    expect(names).toContain("plan");
+  });
+
+  it("excludes /init virtual for Claude (CLI passthrough handles it)", () => {
+    const merged = mergeWithVirtual([], "claude");
+    const initEntry = merged.find((c) => c.name === "init");
+    expect(initEntry).toBeUndefined();
+  });
+
+  it("includes /init virtual for Codex", () => {
+    const merged = mergeWithVirtual([], "codex");
+    const initEntry = merged.find((c) => c.name === "init");
+    expect(initEntry).toBeDefined();
+    expect(initEntry?.["_virtual"]).toBe(true);
+    expect(initEntry?.["_action"]).toBe("init-project");
+  });
+
+  it("keeps /memory virtual navigate even when CLI also returns memory", () => {
+    // Claude CLI has its own /memory command (opens $EDITOR on CLAUDE.md).
+    // OpenCovibe intentionally intercepts /memory to route to the in-app
+    // memory page on BOTH agents — this test locks that behaviour so a future
+    // refactor can't silently revert to CLI passthrough.
+    const cli: CliCommand[] = [{ name: "memory", description: "Edit memory", aliases: [] }];
+    const merged = mergeWithVirtual(cli, "claude");
+    const mem = merged.find((c) => c.name === "memory")!;
+    expect(mem["_virtual"]).toBe(true);
+    expect(mem["_navigate"]).toBe("/memory");
+  });
+
+  // ── Codex P2: /mcp /agents /hooks Extend-page virtuals ──
+  // Same pattern as /memory: OpenCovibe owns these UIs; CLI passthrough is
+  // intercepted on both agents.
+
+  it("keeps /mcp virtual navigate even when CLI also returns mcp", () => {
+    const cli: CliCommand[] = [{ name: "mcp", description: "Manage MCP", aliases: [] }];
+    const merged = mergeWithVirtual(cli, "claude");
+    const mcp = merged.find((c) => c.name === "mcp")!;
+    expect(mcp["_virtual"]).toBe(true);
+    expect(mcp["_navigate"]).toContain("section=mcp");
+  });
+
+  it("keeps /agents virtual navigate even when CLI also returns agents", () => {
+    const cli: CliCommand[] = [{ name: "agents", description: "Manage agents", aliases: [] }];
+    const merged = mergeWithVirtual(cli, "claude");
+    const agents = merged.find((c) => c.name === "agents")!;
+    expect(agents["_virtual"]).toBe(true);
+    expect(agents["_navigate"]).toBe("/plugins?section=agents");
+  });
+
+  it("keeps /hooks virtual navigate even when CLI also returns hooks", () => {
+    const cli: CliCommand[] = [{ name: "hooks", description: "Manage hooks", aliases: [] }];
+    const merged = mergeWithVirtual(cli, "claude");
+    const hooks = merged.find((c) => c.name === "hooks")!;
+    expect(hooks["_virtual"]).toBe(true);
+    expect(hooks["_navigate"]).toBe("/plugins?section=hooks");
+  });
+
+  // ── Codex Wave 3: /skills /resume /theme /feedback ──
+
+  it("/skills virtual navigates to plugins skills section", () => {
+    const merged = mergeWithVirtual([]);
+    const skills = merged.find((c) => c.name === "skills")!;
+    expect(skills["_virtual"]).toBe(true);
+    expect(skills["_navigate"]).toContain("?section=skills");
+  });
+
+  it("/resume virtual navigates to /history", () => {
+    const merged = mergeWithVirtual([]);
+    const resume = merged.find((c) => c.name === "resume")!;
+    expect(resume["_virtual"]).toBe(true);
+    expect(resume["_navigate"]).toBe("/history");
+  });
+
+  it("/theme virtual navigates to settings general tab", () => {
+    const merged = mergeWithVirtual([]);
+    const theme = merged.find((c) => c.name === "theme")!;
+    expect(theme["_virtual"]).toBe(true);
+    expect(theme["_navigate"]).toContain("tab=general");
+  });
+
+  it("/feedback virtual carries open-feedback action", () => {
+    // Direct mergeWithVirtual check ensures the virtual carries the right
+    // _action metadata — `parseVirtualAction` only returns name+args.
+    const merged = mergeWithVirtual([]);
+    const fb = merged.find((c) => c.name === "feedback")!;
+    expect(fb["_virtual"]).toBe(true);
+    expect(fb["_action"]).toBe("open-feedback");
+  });
+
+  // CLI passthrough override locks — same pattern as /memory /mcp.
+  it("keeps /skills virtual navigate even when CLI also returns skills", () => {
+    const cli: CliCommand[] = [{ name: "skills", description: "List skills", aliases: [] }];
+    const merged = mergeWithVirtual(cli, "claude");
+    const s = merged.find((c) => c.name === "skills")!;
+    expect(s["_virtual"]).toBe(true);
+    expect(s["_navigate"]).toContain("?section=skills");
+  });
+
+  it("keeps /resume virtual navigate even when CLI also returns resume", () => {
+    const cli: CliCommand[] = [{ name: "resume", description: "Resume", aliases: [] }];
+    const merged = mergeWithVirtual(cli, "claude");
+    const r = merged.find((c) => c.name === "resume")!;
+    expect(r["_virtual"]).toBe(true);
+    expect(r["_navigate"]).toBe("/history");
+  });
+
+  it("keeps /theme virtual navigate even when CLI also returns theme", () => {
+    const cli: CliCommand[] = [{ name: "theme", description: "Change theme", aliases: [] }];
+    const merged = mergeWithVirtual(cli, "claude");
+    const t = merged.find((c) => c.name === "theme")!;
+    expect(t["_virtual"]).toBe(true);
+    expect(t["_navigate"]).toContain("tab=general");
+  });
 });
 
 // ── isVirtualCommand ──
@@ -356,8 +488,207 @@ describe("parseVirtualAction", () => {
     expect(parseVirtualAction("/compact")).toBeNull();
   });
 
+  it("resolves Codex aliases /quit → clear and /memories → memory", () => {
+    expect(parseVirtualAction("/quit", "codex")).toEqual({ name: "clear", args: "" });
+    expect(parseVirtualAction("/memories", "codex")).toEqual({ name: "memory", args: "" });
+    // both names recognized for Codex
+    const known = getKnownVirtualNames("codex");
+    expect(known.has("quit")).toBe(true);
+    expect(known.has("memories")).toBe(true);
+  });
+
   it("returns null for plain text", () => {
     expect(parseVirtualAction("hello world")).toBeNull();
+  });
+
+  // ── Codex P1 agent-gated virtuals ──
+
+  it("excludes /init for Claude (lets CLI passthrough handle it)", () => {
+    // Claude CLI has its own /init that writes CLAUDE.md; OpenCovibe must not
+    // intercept it as a virtual.
+    expect(parseVirtualAction("/init", "claude")).toBeNull();
+  });
+
+  it("activates /init for Codex (OpenCovibe handles via init-project action)", () => {
+    expect(parseVirtualAction("/init", "codex")).toEqual({ name: "init", args: "" });
+  });
+
+  it("excludes /ralph for Codex (Ralph requires stream-session, Codex is pipe-exec)", () => {
+    expect(parseVirtualAction("/ralph foo", "codex")).toBeNull();
+    expect(parseVirtualAction("/cancel-ralph", "codex")).toBeNull();
+  });
+
+  // ── Codex Wave-3 virtuals ──
+
+  it("activates /compact for Codex but excludes it for Claude (CLI passthrough)", () => {
+    expect(parseVirtualAction("/compact", "codex")).toEqual({ name: "compact", args: "" });
+    expect(parseVirtualAction("/compact", "claude")).toBeNull();
+  });
+
+  it("activates /goal for Codex and excludes it for Claude", () => {
+    expect(parseVirtualAction("/goal", "codex")).toEqual({ name: "goal", args: "" });
+    expect(parseVirtualAction("/goal", "claude")).toBeNull();
+  });
+
+  it("resolves /rewind to the Codex variant for Codex (turn-based, not snapshot)", () => {
+    // Two virtuals share the name "rewind": Claude (snapshot, excludes codex)
+    // and Codex (history rollback, excludes claude). parseVirtualAction must
+    // pick the non-excluded variant per agent rather than short-circuit on the
+    // first match.
+    expect(parseVirtualAction("/rewind", "codex")).toEqual({ name: "rewind", args: "" });
+    expect(parseVirtualAction("/rewind", "claude")).toEqual({ name: "rewind", args: "" });
+    // Alias /undo resolves for both too.
+    expect(parseVirtualAction("/undo", "codex")).toEqual({ name: "rewind", args: "" });
+  });
+
+  it("default agent treats request as Claude — guards against regression", () => {
+    // If we ever flip the default to "codex" by mistake, Ralph silently breaks
+    // for the entire Claude population. Lock the default behaviour.
+    expect(parseVirtualAction("/ralph foo")).toEqual({
+      name: "ralph",
+      args: "foo",
+    });
+  });
+
+  // ── Codex P2 ──
+
+  it("/agent on Codex resolves to agent virtual (not /agents Extend page)", () => {
+    // Wave 4a reverts wave 2's alias mapping. Codex TUI's /agent opens a
+    // sub-agent picker — semantically different from the Extend Agents page.
+    // OpenCovibe routes Codex /agent to a dedicated informative virtual.
+    expect(parseVirtualAction("/agent", "codex")).toEqual({
+      name: "agent",
+      args: "",
+    });
+  });
+
+  it("/agent is not handled on Claude (no Claude CLI /agent command)", () => {
+    // Claude CLI does NOT have a singular /agent command — only /agents
+    // (plural). On Claude sessions /agent falls through (parser returns null
+    // = no virtual handles it; gets sent to CLI as a typed message, which
+    // Claude CLI will ignore).
+    expect(parseVirtualAction("/agent", "claude")).toBeNull();
+  });
+
+  it("/agents (plural) still navigates to Extend page on both agents", () => {
+    // Lock the surviving /agents behaviour after the alias removal.
+    expect(parseVirtualAction("/agents", "claude")).toEqual({
+      name: "agents",
+      args: "",
+    });
+    expect(parseVirtualAction("/agents", "codex")).toEqual({
+      name: "agents",
+      args: "",
+    });
+  });
+
+  it("agents virtual no longer carries /agent alias after Codex picker fix", () => {
+    // Regression guard for wave 4a: the singular alias on /agents was
+    // misleading users into the Extend page when Codex's /agent should open
+    // a sub-agent picker (a UI OpenCovibe doesn't have yet).
+    const merged = mergeWithVirtual([], "codex");
+    const agents = merged.find((c) => c.name === "agents")!;
+    expect(agents.aliases ?? []).not.toContain("agent");
+  });
+
+  it("agent virtual carries codex-agent-info action on Codex", () => {
+    const merged = mergeWithVirtual([], "codex");
+    const agent = merged.find((c) => c.name === "agent")!;
+    expect(agent["_virtual"]).toBe(true);
+    expect(agent["_action"]).toBe("codex-agent-info");
+  });
+
+  it("review virtual carries codex-review action on Codex", () => {
+    const merged = mergeWithVirtual([], "codex");
+    const review = merged.find((c) => c.name === "review")!;
+    expect(review["_virtual"]).toBe(true);
+    expect(review["_action"]).toBe("codex-review");
+  });
+
+  it("/review on Codex resolves to review virtual", () => {
+    expect(parseVirtualAction("/review", "codex")).toEqual({
+      name: "review",
+      args: "",
+    });
+  });
+
+  it("/review on Claude falls through to CLI passthrough", () => {
+    // Claude CLI handles /review itself (PR review).
+    expect(parseVirtualAction("/review", "claude")).toBeNull();
+  });
+
+  it("excludes /login for Claude (Claude CLI handles its own /login)", () => {
+    expect(parseVirtualAction("/login", "claude")).toBeNull();
+  });
+
+  it("activates /login for Codex", () => {
+    expect(parseVirtualAction("/login", "codex")).toEqual({
+      name: "login",
+      args: "",
+    });
+  });
+
+  it("excludes /logout for Claude (CLI passthrough)", () => {
+    expect(parseVirtualAction("/logout", "claude")).toBeNull();
+  });
+
+  it("activates /logout for Codex", () => {
+    expect(parseVirtualAction("/logout", "codex")).toEqual({
+      name: "logout",
+      args: "",
+    });
+  });
+
+  // ── Codex Wave 3: /feedback parse + alias mappings ──
+
+  it("/feedback parses as feedback virtual", () => {
+    expect(parseVirtualAction("/feedback")).toEqual({
+      name: "feedback",
+      args: "",
+    });
+  });
+
+  it("/keymap resolves to /keybindings via alias", () => {
+    // Codex CLI names this `/keymap`; OpenCovibe routes both to the same
+    // navigate target.
+    expect(parseVirtualAction("/keymap")).toEqual({
+      name: "keybindings",
+      args: "",
+    });
+  });
+
+  it("/new, /exit, /quit resolve to /clear on Codex only (Codex CLI alias parity)", () => {
+    // GUI parity for Codex: /new starts a new chat (same as /clear); /exit and
+    // /quit don't quit the app — they leave the current chat back to the welcome
+    // page, again identical to /clear semantics. These aliases were added for
+    // Codex CLI parity, so they only fire for Codex.
+    expect(parseVirtualAction("/new", "codex")).toEqual({ name: "clear", args: "" });
+    expect(parseVirtualAction("/exit", "codex")).toEqual({ name: "clear", args: "" });
+    expect(parseVirtualAction("/quit", "codex")).toEqual({ name: "clear", args: "" });
+  });
+
+  it("/new, /exit, /quit fall through on Claude (no silent clear-context override)", () => {
+    // Claude CLI owns /exit and /quit (and has no /new). OpenCovibe must not
+    // intercept these as clear-context — they fall through to CLI passthrough.
+    expect(parseVirtualAction("/new", "claude")).toBeNull();
+    expect(parseVirtualAction("/exit", "claude")).toBeNull();
+    expect(parseVirtualAction("/quit", "claude")).toBeNull();
+    // Default agent is Claude — same fall-through behaviour.
+    expect(parseVirtualAction("/new")).toBeNull();
+    expect(parseVirtualAction("/exit")).toBeNull();
+  });
+
+  it("/side resolves to /btw on Codex only (Codex CLI alias parity)", () => {
+    // Codex CLI's `/side` is OpenCovibe's `/btw`. The alias is Codex-only.
+    expect(parseVirtualAction("/side what is X", "codex")).toEqual({
+      name: "btw",
+      args: "what is X",
+    });
+  });
+
+  it("/side falls through on Claude (no silent /btw override)", () => {
+    expect(parseVirtualAction("/side what is X", "claude")).toBeNull();
+    expect(parseVirtualAction("/side what is X")).toBeNull();
   });
 });
 
@@ -405,6 +736,15 @@ describe("getQuickActions", () => {
     }));
     const result = getQuickActions(allCmds);
     expect(result.length).toBe(QUICK_ACTION_NAMES.length);
+  });
+
+  it("surfaces /compact as a Codex quick action", () => {
+    // Codex pills lead with compact (Wave-3). For Codex, mergeWithVirtual
+    // produces the compact virtual since the CLI returns no commands.
+    const merged = mergeWithVirtual([], "codex");
+    const result = getQuickActions(merged, "codex");
+    expect(result.map((c) => c.name)).toContain("compact");
+    expect(result[0].name).toBe("compact");
   });
 });
 

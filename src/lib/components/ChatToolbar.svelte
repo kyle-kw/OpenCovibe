@@ -122,7 +122,7 @@
 
 <div class="flex flex-wrap items-center gap-1.5 px-6 py-2 border-b bg-muted/20">
   <!-- Model selector -->
-  <ModelSelector bind:value={model} _agent={agent} onchange={handleModelChange} />
+  <ModelSelector bind:value={model} {agent} onchange={handleModelChange} />
 
   <!-- Platform label (API mode, read-only) -->
   {#if authMode === "api" && platformId && platformId !== "anthropic"}

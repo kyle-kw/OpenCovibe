@@ -39,11 +39,28 @@ pub async fn check_auth_status() -> Result<AuthCheckResult, String> {
     })
 }
 
-/// Detect which CLI installation methods are available on this system.
+/// Detect which CLI installation methods are available for the given agent.
+/// Unknown agent values fall back to Claude (preserves old behavior for callers
+/// that haven't been updated yet).
 #[tauri::command]
-pub async fn detect_install_methods() -> Result<Vec<InstallMethod>, String> {
-    log::debug!("[onboarding] detect_install_methods");
+pub async fn detect_install_methods(agent: String) -> Result<Vec<InstallMethod>, String> {
+    log::debug!("[onboarding] detect_install_methods: agent={}", agent);
+    let methods = match agent.as_str() {
+        "codex" => detect_codex_install_methods().await,
+        _ => detect_claude_install_methods().await,
+    };
+    log::debug!(
+        "[onboarding] install methods ({}): {:?}",
+        agent,
+        methods
+            .iter()
+            .map(|m| format!("{}={}", m.id, m.available))
+            .collect::<Vec<_>>()
+    );
+    Ok(methods)
+}
 
+async fn detect_claude_install_methods() -> Vec<InstallMethod> {
     let mut methods = Vec::new();
 
     // 1. Homebrew — macOS/Linux only (not relevant on Windows)
@@ -153,14 +170,46 @@ pub async fn detect_install_methods() -> Result<Vec<InstallMethod>, String> {
         });
     }
 
-    log::debug!(
-        "[onboarding] install methods: {:?}",
-        methods
-            .iter()
-            .map(|m| format!("{}={}", m.id, m.available))
-            .collect::<Vec<_>>()
-    );
-    Ok(methods)
+    methods
+}
+
+async fn detect_codex_install_methods() -> Vec<InstallMethod> {
+    let mut methods = Vec::new();
+
+    // Homebrew — macOS/Linux only
+    #[cfg(not(windows))]
+    {
+        let has_brew = which_binary("brew");
+        methods.push(InstallMethod {
+            id: "brew".into(),
+            name: "Homebrew".into(),
+            command: "brew install codex".into(),
+            available: has_brew,
+            unavailable_reason: if has_brew {
+                None
+            } else {
+                Some("Homebrew not installed".into())
+            },
+            note: None,
+        });
+    }
+
+    // npm — official cross-platform install path for Codex CLI
+    let has_npm = check_npm_available().await;
+    methods.push(InstallMethod {
+        id: "npm".into(),
+        name: "npm (Node.js)".into(),
+        command: "npm install -g @openai/codex".into(),
+        available: has_npm,
+        unavailable_reason: if has_npm {
+            None
+        } else {
+            Some("Requires Node.js 18+".into())
+        },
+        note: None,
+    });
+
+    methods
 }
 
 /// Run `claude login` to start the OAuth flow. The CLI opens a browser automatically.
@@ -204,6 +253,111 @@ pub async fn run_claude_login(app: AppHandle) -> Result<bool, String> {
     );
 
     Ok(success)
+}
+
+/// Resolve the `codex` CLI binary path. Shared between `run_codex_login` and
+/// `run_codex_logout` so both commands use the same resolution strategy
+/// (falling back to a bare `"codex"` literal when `which_binary` fails so the
+/// OS PATH lookup still has a chance).
+fn resolve_codex_binary() -> String {
+    // Candidate-list resolver (npm %APPDATA%\npm\codex.cmd etc.) so Windows login works even
+    // when `where codex` doesn't surface the .cmd shim.
+    claude_stream::resolve_codex_path()
+}
+
+/// Run `codex login` to start the OAuth flow. The CLI opens a browser automatically.
+#[tauri::command]
+pub async fn run_codex_login(app: AppHandle) -> Result<bool, String> {
+    let aug_path = claude_stream::augmented_path();
+    let codex_bin = resolve_codex_binary();
+    log::debug!("[onboarding] run_codex_login: binary={}", codex_bin);
+
+    let mut child = Command::new(&codex_bin)
+        .arg("login")
+        .env("PATH", &aug_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .hide_console()
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("Failed to spawn codex login: {}", e))?;
+
+    log::debug!("[onboarding] run_codex_login: spawned");
+
+    if let Some(stdout) = child.stdout.take() {
+        let app_clone = app.clone();
+        tokio::spawn(async move {
+            stream_pipe_to_events(stdout, app_clone, "codex login stdout").await
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let app_clone = app.clone();
+        tokio::spawn(async move {
+            stream_pipe_to_events(stderr, app_clone, "codex login stderr").await
+        });
+    }
+
+    let status = tokio::time::timeout(std::time::Duration::from_secs(180), child.wait())
+        .await
+        .map_err(|_| "Codex login timed out after 3 minutes".to_string())?
+        .map_err(|e| format!("Codex login process error: {}", e))?;
+
+    log::debug!(
+        "[onboarding] run_codex_login: exit={:?}, success={}",
+        status.code(),
+        status.success()
+    );
+
+    if !status.success() {
+        return Err(format!(
+            "Codex login exited with code {}",
+            status
+                .code()
+                .map_or("unknown".into(), |c: i32| c.to_string())
+        ));
+    }
+
+    Ok(true)
+}
+
+/// Run `codex logout` to clear stored credentials. Non-interactive, returns
+/// quickly. Mirrors `run_codex_login`'s binary resolution.
+#[tauri::command]
+pub async fn run_codex_logout() -> Result<bool, String> {
+    let aug_path = claude_stream::augmented_path();
+    let codex_bin = resolve_codex_binary();
+    log::debug!("[onboarding] run_codex_logout: binary={}", codex_bin);
+
+    let output = Command::new(&codex_bin)
+        .arg("logout")
+        .env("PATH", &aug_path)
+        .hide_console()
+        .output()
+        .await
+        .map_err(|e| format!("Failed to spawn codex logout: {}", e))?;
+
+    log::debug!(
+        "[onboarding] run_codex_logout: exit={:?}, success={}",
+        output.status.code(),
+        output.status.success()
+    );
+
+    if output.status.success() {
+        Ok(true)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            format!(
+                "Codex logout exited with code {}",
+                output
+                    .status
+                    .code()
+                    .map_or("unknown".into(), |c: i32| c.to_string())
+            )
+        } else {
+            stderr
+        })
+    }
 }
 
 /// Get an overview of all authentication sources (configuration state only).
@@ -639,5 +793,46 @@ mod tests {
         assert_eq!(preset_name("ollama"), "Ollama");
         // Unknown falls back to pid
         assert_eq!(preset_name("unknown-xyz"), "unknown-xyz");
+    }
+
+    #[tokio::test]
+    async fn detect_install_methods_codex_includes_npm() {
+        // npm install path is cross-platform and must always be listed for Codex.
+        let methods = detect_install_methods("codex".into()).await.unwrap();
+        let npm = methods
+            .iter()
+            .find(|m| m.id == "npm")
+            .expect("codex npm method");
+        assert_eq!(npm.command, "npm install -g @openai/codex");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn detect_install_methods_codex_includes_brew_on_unix() {
+        let methods = detect_install_methods("codex".into()).await.unwrap();
+        let brew = methods
+            .iter()
+            .find(|m| m.id == "brew")
+            .expect("codex brew method");
+        assert_eq!(brew.command, "brew install codex");
+    }
+
+    #[tokio::test]
+    async fn detect_install_methods_claude_default() {
+        // Claude path keeps its existing commands (regression guard).
+        let methods = detect_install_methods("claude".into()).await.unwrap();
+        let npm = methods
+            .iter()
+            .find(|m| m.id == "npm")
+            .expect("claude npm method");
+        assert_eq!(npm.command, "npm install -g @anthropic-ai/claude-code");
+    }
+
+    #[tokio::test]
+    async fn detect_install_methods_invalid_falls_back_to_claude() {
+        // Unknown agent values fall back to Claude to preserve old callers.
+        let methods = detect_install_methods("nonsense".into()).await.unwrap();
+        let npm = methods.iter().find(|m| m.id == "npm").expect("npm method");
+        assert!(npm.command.contains("@anthropic-ai/claude-code"));
     }
 }

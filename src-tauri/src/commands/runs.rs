@@ -4,19 +4,14 @@ use crate::storage;
 use std::collections::{HashMap, HashSet};
 
 /// Validate that agent supports the requested execution path.
-fn validate_agent_path(agent: &str, path: &ExecutionPath) -> Result<(), String> {
+/// Both supported agents now accept either path (Claude: stream-json/--print;
+/// Codex: app-server/exec), so this only rejects unknown agents.
+fn validate_agent_path(agent: &str, _path: &ExecutionPath) -> Result<(), String> {
     match agent {
         "claude" => Ok(()), // Claude supports both session_actor and pipe_exec
-        "codex" => {
-            if *path == ExecutionPath::PipeExec {
-                Ok(())
-            } else {
-                Err(format!(
-                    "agent 'codex' does not support execution_path {:?}",
-                    path
-                ))
-            }
-        }
+        // Codex supports pipe_exec (legacy `codex exec`) and session_actor
+        // (`codex app-server` bidirectional transport — interactive tools).
+        "codex" => Ok(()),
         _ => Err(format!(
             "unknown agent '{}': supported agents are 'claude' and 'codex'",
             agent
@@ -95,6 +90,20 @@ pub fn start_run(
         })?,
         None => {
             if agent == "claude" {
+                ExecutionPath::SessionActor
+            } else if agent == "codex"
+                && storage::settings::get_user_settings()
+                    .codex_transport
+                    .as_deref()
+                    != Some("exec")
+                && crate::commands::session::codex_appserver_supported()
+            {
+                // Codex DEFAULTS to the app-server (bidirectional session_actor) path so the
+                // interactive tools (approvals, steer, fork/rewind/compact/goal, images, live
+                // command output) work out of the box — most of the Codex feature surface
+                // depends on it. Only an explicit "exec" setting opts out, OR an installed
+                // Codex CLI too old for `codex app-server --enable …` (the probe) — in which
+                // case we auto-fall back to the one-shot exec transport so the run still works.
                 ExecutionPath::SessionActor
             } else {
                 ExecutionPath::PipeExec

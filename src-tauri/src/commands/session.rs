@@ -1,7 +1,10 @@
 use crate::agent::adapter::{self, ActorSessionMap};
 use crate::agent::claude_stream;
+use crate::agent::codex_appserver::CodexAppServer;
 use crate::agent::session_actor::{self, ActorCommand, AttachmentData, RalphCancelResult};
+use crate::agent::session_protocol::{CodexSkillRef, SessionProtocol, StartupCtx};
 use crate::agent::spawn_locks::SpawnLocks;
+use crate::models::ConversationRef;
 use crate::models::{BusEvent, RemoteHost, RunMeta, RunStatus, SessionMode, UserSettings};
 use crate::process_ext::HideConsole;
 use crate::storage;
@@ -632,26 +635,70 @@ pub(crate) async fn start_session_impl(
         );
     }
 
-    // 6. Spawn CLI process (no initial stdin write — actor handles it)
+    // 6. Spawn CLI process (no initial stdin write — actor handles it).
+    // Codex on the session_actor path uses the bidirectional `codex app-server` transport;
+    // everything else (Claude, and Codex would-be-pipe_exec) uses the stream-json child.
     let effective_cwd = meta.remote_cwd.as_deref().unwrap_or(&meta.cwd);
-    let (child, stdin, stdout, stderr) = spawn_cli_process(
-        effective_cwd,
-        &meta.prompt,
-        &adapter_settings,
-        &session_mode,
-        resume_session_id.as_deref(),
-        is_new,
-        &att_list,
-        remote.as_ref(),
-        meta.remote_cwd.as_deref(),
-        resolved.api_key.as_deref(),
-        resolved.auth_token.as_deref(),
-        resolved.base_url.as_deref(),
-        &run_id,
-        resolved.models.as_deref(),
-        resolved.extra_env.as_ref(),
-    )
-    .await?;
+    let is_codex = meta.agent == "codex";
+    let (child, stdin, stdout, stderr, codex, codex_startup) = if is_codex {
+        if remote.is_some() {
+            return Err("Codex app-server transport is not supported on remote hosts yet".into());
+        }
+        let (c, si, so, se) = spawn_codex_appserver_process(
+            effective_cwd,
+            &adapter_settings,
+            resolved.extra_env.as_ref(),
+        )
+        .await?;
+        let resume_tid = meta.resolved_conversation_ref().and_then(|r| match r {
+            ConversationRef::CodexThread(t) => Some(t),
+            _ => None,
+        });
+        let mut driver = CodexAppServer::new();
+        let ctx = StartupCtx {
+            cwd: effective_cwd.to_string(),
+            resume_thread_id: resume_tid,
+            model: adapter_settings.model.clone(),
+            model_provider: adapter_settings
+                .codex_provider
+                .as_ref()
+                .map(|p| p.id.clone()),
+            // Approval policy derived from permission_mode (mirrors the sandbox mapping):
+            // bypassPermissions/dontAsk → "never" (no prompts, matches danger-full-access),
+            // everything else → "on-request" (the interactive policy Codex's own TUI uses;
+            // surfaces an approval card when a command needs to escape the sandbox).
+            approval_policy: Some(codex_approval_for(
+                adapter_settings.permission_mode.as_deref(),
+            )),
+            sandbox: Some(codex_sandbox_for(
+                adapter_settings.permission_mode.as_deref(),
+            )),
+            effort: adapter_settings.effort.clone().filter(|e| !e.is_empty()),
+            add_dirs: adapter_settings.add_dirs.clone(),
+        };
+        let startup = driver.startup_messages(&ctx);
+        (c, si, so, se, Some(driver), startup)
+    } else {
+        let (c, si, so, se) = spawn_cli_process(
+            effective_cwd,
+            &meta.prompt,
+            &adapter_settings,
+            &session_mode,
+            resume_session_id.as_deref(),
+            is_new,
+            &att_list,
+            remote.as_ref(),
+            meta.remote_cwd.as_deref(),
+            resolved.api_key.as_deref(),
+            resolved.auth_token.as_deref(),
+            resolved.base_url.as_deref(),
+            &run_id,
+            resolved.models.as_deref(),
+            resolved.extra_env.as_ref(),
+        )
+        .await?;
+        (c, si, so, se, None, vec![])
+    };
 
     // 7. Compute turn baselines — 1-based: next_turn_index = N means next message gets turnIndex=N.
     // New session: first message gets turnIndex=1. Resume: first new message gets total+1.
@@ -680,22 +727,31 @@ pub(crate) async fn start_session_impl(
         cancel_token.clone(),
         initial_turn_index,
         initial_auto_ctx_id,
+        codex,
+        codex_startup,
     );
     let cmd_tx = actor_handle.cmd_tx.clone();
     sessions.lock().await.insert(run_id.clone(), actor_handle);
 
-    // 9. Send initial message through actor (unified entry point for Turn Engine)
-    let initial_text = if is_new {
-        Some(meta.prompt.clone())
-    } else {
-        initial_message.clone()
-    };
+    // 9. Send initial message through actor (unified entry point for Turn Engine).
+    // Prefer an explicitly-provided follow-up message; fall back to the stored prompt only
+    // for a brand-new run's first turn. A stopped session re-spawned with a new message
+    // passes initial_message (mode defaults to New, but the Codex thread resumes via
+    // conversation_ref) — it must send that message, NOT re-run the original prompt.
+    let initial_text = initial_message.clone().or_else(|| {
+        if is_new {
+            Some(meta.prompt.clone())
+        } else {
+            None
+        }
+    });
     if let Some(text) = initial_text {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         cmd_tx
             .send(ActorCommand::SendMessage {
                 text,
                 attachments: att_list,
+                skills: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -778,14 +834,17 @@ pub async fn send_session_message(
     run_id: String,
     message: String,
     attachments: Option<Vec<AttachmentData>>,
+    skills: Option<Vec<CodexSkillRef>>,
 ) -> Result<(), String> {
     // No SpawnLock — data operation, routed through actor channel
     let att_count = attachments.as_ref().map_or(0, |v| v.len());
+    let skill_count = skills.as_ref().map_or(0, |v| v.len());
     log::debug!(
-        "[session] send_session_message: run_id={}, msg_len={}, attachments={}",
+        "[session] send_session_message: run_id={}, msg_len={}, attachments={}, skills={}",
         run_id,
         message.len(),
-        att_count
+        att_count,
+        skill_count
     );
 
     // Get channel sender
@@ -797,6 +856,7 @@ pub async fn send_session_message(
         .send(ActorCommand::SendMessage {
             text: message.clone(),
             attachments: attachments.unwrap_or_default(),
+            skills: skills.unwrap_or_default(),
             reply: reply_tx,
         })
         .await
@@ -988,6 +1048,21 @@ pub(crate) async fn fork_session_impl(
     // 1. Read source run metadata
     let source =
         storage::runs::get_run(&run_id).ok_or_else(|| format!("Run {} not found", run_id))?;
+
+    // Codex forks through the LIVE app-server (thread/fork returns a new thread id) — no oneshot
+    // process, no session_id. Delegate to the Codex-specific path.
+    if source.agent == "codex" {
+        return fork_session_codex(sessions, &run_id, &source).await;
+    }
+
+    // Guard: the oneshot fork path below is Claude-only (session-id based).
+    if source.agent != "claude" {
+        return Err(format!(
+            "Fork is not supported for {} sessions",
+            source.agent
+        ));
+    }
+
     let session_id = source
         .session_id
         .clone()
@@ -1109,6 +1184,91 @@ pub(crate) async fn fork_session_impl(
 
     log::debug!(
         "[session] fork_session completed: {} → {} (frontend will start_session to connect)",
+        run_id,
+        new_id
+    );
+    Ok(new_id)
+}
+
+/// Codex fork: unlike Claude (oneshot process + new session_id), Codex forks via the LIVE
+/// app-server — `thread/fork` returns a brand-new thread id at `result.thread.id`. We send the
+/// `fork` control to the running actor, await the new thread id, then create a new run pointing
+/// at that thread (`ConversationRef::CodexThread`) with the source's events copied so the
+/// frontend can switch to it (same contract as Claude: returns the new run id).
+///
+/// The source actor stays ALIVE (no stop) — fork is non-destructive; both threads remain usable.
+/// Requires a live session (the thread must exist server-side to be forked).
+async fn fork_session_codex(
+    sessions: &ActorSessionMap,
+    run_id: &str,
+    source: &RunMeta,
+) -> Result<String, String> {
+    // 1. The thread must be live to fork — get the actor command channel.
+    let cmd_tx = get_cmd_tx(sessions, run_id)
+        .await
+        .map_err(|_| "Fork requires a live Codex session (start it first)".to_string())?;
+
+    // 2. Send the `fork` control through the actor; await the JSON-RPC reply.
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(ActorCommand::SendControl {
+            request: serde_json::json!({ "subtype": "fork" }),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "Actor dead".to_string())?;
+    let (_, response_rx) = reply_rx
+        .await
+        .map_err(|_| "Actor dropped fork reply".to_string())??;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(10), response_rx)
+        .await
+        .map_err(|_| "Timeout waiting for thread/fork response".to_string())?
+        .map_err(|_| "Fork response channel closed (session may have ended)".to_string())?;
+
+    // 3. Extract the new thread id from `result.thread.id`.
+    let new_thread_id = response
+        .get("thread")
+        .and_then(|t| t.get("id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            format!(
+                "thread/fork response missing thread.id: {}",
+                truncate_str(&response.to_string(), 200)
+            )
+        })?
+        .to_string();
+    log::debug!(
+        "[session] fork_session_codex: source {} → new thread {}",
+        run_id,
+        new_thread_id
+    );
+
+    // 4. Create the new run (inherit prompt/cwd/model/remote/platform; parent = source run).
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let mut meta = storage::runs::create_run(
+        &new_id,
+        &source.prompt,
+        &source.cwd,
+        &source.agent,
+        RunStatus::Pending,
+        source.model.clone(),
+        Some(run_id.to_string()),
+        source.remote_host_name.clone(),
+        source.remote_cwd.clone(),
+        source.remote_host_snapshot.clone(),
+        source.platform_id.clone(),
+    )?;
+
+    // 5. Copy parent events so the forked timeline shows the shared history.
+    storage::events::copy_bus_events(run_id, &new_id)?;
+
+    // 6. Point the new run at the forked thread; inherit execution_path.
+    meta.execution_path = Some(source.resolved_execution_path());
+    meta.conversation_ref = Some(ConversationRef::CodexThread(new_thread_id));
+    storage::runs::save_meta(&meta)?;
+
+    log::debug!(
+        "[session] fork_session_codex completed: {} → {} (frontend will start_session to connect)",
         run_id,
         new_id
     );
@@ -1269,6 +1429,8 @@ pub(crate) async fn approve_session_tool_impl(
         cancel_token.clone(),
         total + 1,
         normal + 1,
+        None, // Claude transport
+        vec![],
     );
     sessions.lock().await.insert(run_id.clone(), actor_handle);
 
@@ -1288,6 +1450,7 @@ pub(crate) async fn approve_session_tool_impl(
         .send(ActorCommand::SendMessage {
             text: retry_msg,
             attachments: Vec::new(),
+            skills: Vec::new(),
             reply: reply_tx,
         })
         .await
@@ -1478,6 +1641,46 @@ pub async fn cancel_control_request(
 }
 
 /// Respond to an MCP elicitation control request.
+/// Answer a Codex `request_user_input` (multiple-choice) prompt. `answers` maps each
+/// question id to the selected option label(s): `{ "<qid>": ["<label>", ...] }`. Routed to
+/// the app-server as a JSON-RPC response on the pending request (Codex transport only).
+#[tauri::command]
+pub async fn respond_user_input(
+    sessions: State<'_, ActorSessionMap>,
+    run_id: String,
+    request_id: String,
+    answers: serde_json::Value,
+) -> Result<(), String> {
+    log::debug!(
+        "[session] respond_user_input: run_id={}, req_id={}",
+        run_id,
+        request_id
+    );
+    if !answers.is_object() {
+        return Err("answers must be a JSON object keyed by question id".into());
+    }
+    let response = serde_json::json!({ "answers": answers });
+
+    let cmd_tx = get_cmd_tx(&sessions, &run_id).await?;
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(ActorCommand::RespondUserInput {
+            request_id: request_id.clone(),
+            response,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "Actor dead".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "Actor dropped reply".to_string())??;
+    log::debug!(
+        "[session] respond_user_input: delivered req_id={}",
+        request_id
+    );
+    Ok(())
+}
+
 /// Writes a control_response back to CLI stdin via the actor.
 #[tauri::command]
 pub async fn respond_elicitation(
@@ -1661,6 +1864,151 @@ fn augment_with_shell_auth(
 /// Spawn a Claude CLI process and return (Child, ChildStdin, ChildStdout, ChildStderr).
 /// Sends the initial prompt via stdin for new sessions.
 /// For remote sessions, wraps the CLI command in SSH.
+#[allow(clippy::too_many_arguments)]
+/// Map OpenCovibe permission_mode → Codex app-server `sandbox` mode.
+pub(crate) fn codex_sandbox_for(perm: Option<&str>) -> String {
+    match perm {
+        Some("plan") => "read-only".to_string(),
+        Some("bypassPermissions") | Some("dontAsk") => "danger-full-access".to_string(),
+        _ => "workspace-write".to_string(),
+    }
+}
+
+/// Map OpenCovibe permission_mode → Codex `AskForApproval` string. Mirrors the sandbox mapping
+/// (`codex_sandbox_for`): the relaxed modes get full autonomy ("never" — no approval prompts to
+/// match danger-full-access), everything else keeps the interactive "on-request" policy the TUI
+/// uses (Codex surfaces an approval card when a command needs to escape the sandbox).
+pub(crate) fn codex_approval_for(perm: Option<&str>) -> String {
+    match perm {
+        Some("bypassPermissions") | Some("dontAsk") => "never".to_string(),
+        _ => "on-request".to_string(),
+    }
+}
+
+/// Auto-fallback probe: does the installed Codex CLI support the app-server transport?
+///
+/// Codex now defaults to app-server (see `commands/runs.rs`), but an old/incompatible CLI
+/// would reject `codex app-server --enable …` and the session would die before the handshake
+/// (process spawns, then exits — NOT a spawn error, so it can't be caught at spawn time).
+/// To avoid that, we probe once: `codex app-server --help` exits 0 AND lists the `--enable`
+/// option only on a CLI new enough to run our interactive transport. If not, the run falls
+/// back to the one-shot `exec` path. `--help` returns immediately, so this is a cheap sync
+/// check; the result is cached for the process lifetime (re-probed only after an app restart,
+/// e.g. following a Codex upgrade).
+pub(crate) fn codex_appserver_supported() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let Some(bin) = claude_stream::which_binary("codex") else {
+            log::warn!("[codex] app-server probe: codex binary not found → exec fallback");
+            return false;
+        };
+        let out = std::process::Command::new(&bin)
+            .arg("app-server")
+            .arg("--help")
+            .env("PATH", claude_stream::augmented_path())
+            .output();
+        match out {
+            Ok(o) => {
+                let txt = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                // Need both the subcommand (exit 0) and the `--enable` feature flag we rely on.
+                let ok = o.status.success() && txt.contains("--enable");
+                if ok {
+                    log::debug!("[codex] app-server supported → using interactive transport");
+                } else {
+                    log::warn!(
+                        "[codex] app-server unsupported (help exit={:?}, has --enable={}) → exec fallback",
+                        o.status.code(),
+                        txt.contains("--enable")
+                    );
+                }
+                ok
+            }
+            Err(e) => {
+                log::warn!("[codex] app-server probe failed: {} → exec fallback", e);
+                false
+            }
+        }
+    })
+}
+
+/// Spawn `codex app-server` (bidirectional JSON-RPC) for an interactive Codex session.
+/// Local only — remote/SSH app-server is out of scope for v1. The `--enable
+/// default_mode_request_user_input` flag is REQUIRED for the multiple-choice tool to fire
+/// in normal sessions (verified codex 0.136 — otherwise "unavailable in Default mode").
+async fn spawn_codex_appserver_process(
+    cwd: &str,
+    settings: &adapter::AdapterSettings,
+    extra_env: Option<&std::collections::HashMap<String, String>>,
+) -> Result<
+    (
+        tokio::process::Child,
+        tokio::process::ChildStdin,
+        tokio::process::ChildStdout,
+        tokio::process::ChildStderr,
+    ),
+    String,
+> {
+    use tokio::process::Command;
+
+    let codex_bin = claude_stream::which_binary("codex")
+        .ok_or_else(|| "Codex CLI not found in PATH".to_string())?;
+
+    let mut args: Vec<String> = vec![
+        "app-server".into(),
+        "--enable".into(),
+        "default_mode_request_user_input".into(),
+        "-c".into(),
+        "suppress_unstable_features_warning=true".into(),
+    ];
+
+    // Third-party provider overrides (shared with the exec + side-question paths). The provider
+    // API key is injected as an env var (env_key=api_key) below, mirroring chat.rs's run_agent.
+    if let Some(p) = &settings.codex_provider {
+        args.extend(crate::agent::spawn::codex_provider_config_args(p));
+    }
+
+    let mut cmd = Command::new(&codex_bin);
+    for a in &args {
+        cmd.arg(a);
+    }
+    let path_env = claude_stream::augmented_path();
+    cmd.current_dir(cwd)
+        .env("PATH", &path_env)
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("CLAUDECODE")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .hide_console()
+        .kill_on_drop(true);
+    if let Some(env) = extra_env {
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+    }
+    // Provider API key (env_key=api_key) — the exec path sets this in chat.rs's run_agent, but
+    // the app-server actor path has no such hook, so inject it here.
+    if let Some(p) = &settings.codex_provider {
+        if let Some((k, v)) = crate::agent::spawn::codex_provider_env(p) {
+            cmd.env(k, v);
+        }
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn codex app-server: {}", e))?;
+    let stdin = child.stdin.take().ok_or("no app-server stdin")?;
+    let stdout = child.stdout.take().ok_or("no app-server stdout")?;
+    let stderr = child.stderr.take().ok_or("no app-server stderr")?;
+    Ok((child, stdin, stdout, stderr))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_cli_process(
     cwd: &str,
@@ -1871,6 +2219,12 @@ pub async fn side_question(
     // 1. Read source run metadata
     let source =
         storage::runs::get_run(&run_id).ok_or_else(|| format!("Run {} not found", run_id))?;
+
+    // Codex: ephemeral side question (branch before session_id — Codex has none)
+    if source.agent == "codex" {
+        return codex_side_question(app, &source, &question, &btw_id).await;
+    }
+
     let session_id = source
         .session_id
         .clone()
@@ -2132,6 +2486,331 @@ pub async fn side_question(
 
     log::debug!("[btw] spawned side question stream, btw_id={}", btw_id);
     Ok(btw_id)
+}
+
+// ── Codex side question (ephemeral, read-only) ──
+
+/// Safely truncate a String to at most `max_chars` characters (UTF-8 safe).
+fn safe_tail(s: &mut String, max_chars: usize) {
+    let char_count = s.chars().count();
+    if char_count > max_chars {
+        let skip = char_count - max_chars;
+        if let Some((idx, _)) = s.char_indices().nth(skip) {
+            *s = s[idx..].to_string();
+        }
+    }
+}
+
+/// Extract assistant text only from a Codex NDJSON payload.
+/// Unlike `extract_codex_delta()` this intentionally skips command_execution
+/// output — side questions should only surface the assistant's answer.
+fn extract_codex_btw_text(payload: &serde_json::Value) -> Option<String> {
+    let type_str = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Codex v0.98+: item.completed → item.type == "agent_message" → item.text
+    if type_str == "item.completed" {
+        if let Some(item) = payload.get("item") {
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if item_type == "agent_message" {
+                return item
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+            }
+        }
+    }
+
+    // Direct delta field (older Codex versions)
+    if type_str.contains("delta") {
+        if let Some(delta) = payload.get("delta").and_then(|v| v.as_str()) {
+            return Some(delta.to_string());
+        }
+        if let Some(text) = payload.get("text").and_then(|v| v.as_str()) {
+            return Some(text.to_string());
+        }
+    }
+
+    // output_text field (legacy)
+    if let Some(text) = payload.get("output_text").and_then(|v| v.as_str()) {
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+
+    None
+}
+
+/// Decide which btw event to emit based on what was collected during the stream.
+#[derive(Debug, PartialEq)]
+enum BtwOutcome {
+    /// Got content → emit btw-complete (optionally with a non-zero exit warning).
+    Complete {
+        exit_code: Option<i32>,
+        exit_ok: bool,
+    },
+    /// No content → emit btw-error with this message.
+    Error(String),
+}
+
+fn decide_btw_outcome(
+    got_content: bool,
+    error_msg: Option<String>,
+    exit_code: Option<i32>,
+    exit_ok: bool,
+    stderr_tail: &str,
+) -> BtwOutcome {
+    if got_content {
+        BtwOutcome::Complete { exit_code, exit_ok }
+    } else if let Some(msg) = error_msg {
+        BtwOutcome::Error(msg)
+    } else if stderr_tail.is_empty() {
+        BtwOutcome::Error(format!("Side question failed (exit code: {:?})", exit_code))
+    } else {
+        BtwOutcome::Error(format!(
+            "Side question failed: {}",
+            truncate_str(stderr_tail, 200)
+        ))
+    }
+}
+
+/// Codex ephemeral side question: spawn `codex exec --ephemeral --sandbox read-only --json`
+/// with a timeout. Streams btw-delta/btw-complete/btw-error events to the frontend.
+async fn codex_side_question(
+    app: tauri::AppHandle,
+    source: &RunMeta,
+    question: &str,
+    btw_id: &str,
+) -> Result<String, String> {
+    use crate::agent::claude_stream;
+    use crate::process_ext::HideConsole;
+    use serde_json::Value;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    let codex_bin = claude_stream::which_binary("codex")
+        .ok_or_else(|| "Codex CLI not found in PATH".to_string())?;
+
+    let wrapped_question = format!(
+        "The user is asking a side question. Answer it concisely. \
+         This answer will NOT be added to the conversation history.\n\n{}",
+        question
+    );
+
+    let mut codex_args: Vec<String> = vec![
+        "exec".into(),
+        "--ephemeral".into(),
+        "--sandbox".into(),
+        "read-only".into(),
+        "--json".into(),
+        "--skip-git-repo-check".into(),
+    ];
+
+    // Resolve the configured Codex provider so the side question routes to the same gateway as
+    // the main run (otherwise a custom/gateway provider would be ignored → wrong provider or an
+    // auth error). Mirrors the normal run path: `-c model_providers.*` overrides + env_key=api_key.
+    let user_settings = storage::settings::get_user_settings();
+    let agent_settings = storage::settings::get_agent_settings(&source.agent);
+    let adapter = adapter::build_adapter_settings(&agent_settings, &user_settings, None);
+    let codex_provider = adapter.codex_provider.clone();
+    if let Some(ref p) = codex_provider {
+        codex_args.extend(crate::agent::spawn::codex_provider_config_args(p));
+    }
+
+    // Model: a provider-pinned model wins; otherwise inherit the source run's model (skipping
+    // Claude model names that Codex rejects).
+    let provider_model = codex_provider
+        .as_ref()
+        .map(|p| p.model.clone())
+        .filter(|m| !m.is_empty());
+    if let Some(m) = provider_model {
+        codex_args.push("--model".into());
+        codex_args.push(m);
+    } else if let Some(ref m) = source.model {
+        let lm = m.to_lowercase();
+        let is_claude_model = lm.is_empty()
+            || lm.contains("claude")
+            || lm.contains("opus")
+            || lm.contains("sonnet")
+            || lm.contains("haiku");
+        if !is_claude_model {
+            codex_args.push("--model".into());
+            codex_args.push(m.clone());
+        }
+    }
+
+    // Prompt must be last arg
+    codex_args.push(wrapped_question);
+
+    let effective_cwd = &source.cwd;
+
+    log::debug!(
+        "[btw] codex_side_question: btw_id={}, cwd={}, args_len={}, provider={:?}",
+        btw_id,
+        effective_cwd,
+        codex_args.len(),
+        codex_provider.as_ref().map(|p| &p.id)
+    );
+
+    let mut cmd = Command::new(&codex_bin);
+    for arg in &codex_args {
+        cmd.arg(arg);
+    }
+    let path_env = claude_stream::augmented_path();
+    cmd.current_dir(effective_cwd)
+        .env("PATH", &path_env)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .hide_console()
+        .kill_on_drop(true);
+    // Provider API key (env_key=api_key), same as the main run path.
+    if let Some(ref p) = codex_provider {
+        if let Some((k, v)) = crate::agent::spawn::codex_provider_env(p) {
+            cmd.env(k, v);
+        }
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn Codex side question: {}", e))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("Failed to capture Codex stdout for side question")?;
+    let stderr = child.stderr.take();
+
+    // Wrap child in Arc<Mutex> so the timeout branch can still kill explicitly
+    let child = std::sync::Arc::new(tokio::sync::Mutex::new(child));
+
+    let btw_id_owned = btw_id.to_string();
+    let app_clone = app.clone();
+
+    tokio::spawn(async move {
+        use tauri::Emitter;
+
+        // Drain stderr in background to a ring buffer
+        let stderr_buf = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        if let Some(stderr) = stderr {
+            let buf = stderr_buf.clone();
+            let btw_id_err = btw_id_owned.clone();
+            tokio::spawn(async move {
+                let mut err_reader = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = err_reader.next_line().await {
+                    log::debug!("[btw] codex stderr ({}): {}", btw_id_err, line);
+                    let mut b = buf.lock().await;
+                    if !b.is_empty() {
+                        b.push('\n');
+                    }
+                    b.push_str(&line);
+                    safe_tail(&mut b, 500);
+                }
+            });
+        }
+
+        // Only move stdout reader into the timeout — child stays accessible
+        let child_inner = child.clone();
+        let btw_id_inner = btw_id_owned.clone();
+        let app_inner = app_clone.clone();
+        let read_result = tokio::time::timeout(std::time::Duration::from_secs(120), async move {
+            let mut reader = BufReader::new(stdout).lines();
+            let mut got_content = false;
+            let mut error_msg: Option<String> = None;
+
+            while let Ok(Some(line)) = reader.next_line().await {
+                log::trace!("[btw] codex stdout: {}", truncate_str(&line, 200));
+                if let Ok(obj) = serde_json::from_str::<Value>(&line) {
+                    let event_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                    // BTW-specific: only agent_message text, not command_execution
+                    if let Some(text) = extract_codex_btw_text(&obj) {
+                        got_content = true;
+                        let _ = app_inner.emit(
+                            "btw-delta",
+                            serde_json::json!({
+                                "btw_id": &btw_id_inner,
+                                "text": text
+                            }),
+                        );
+                    } else if event_type == "error" {
+                        let msg = obj
+                            .get("message")
+                            .or_else(|| obj.get("error"))
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("unknown error");
+                        error_msg = Some(msg.to_string());
+                        log::error!("[btw] codex error event: {}", msg);
+                    } else {
+                        log::debug!("[btw] codex event type: {}", event_type);
+                    }
+                }
+            }
+
+            // stdout EOF → wait for process exit
+            let status = child_inner.lock().await.wait().await;
+            (got_content, error_msg, status)
+        })
+        .await;
+
+        match read_result {
+            Ok((got_content, error_msg, status)) => {
+                let exit_ok = status.as_ref().ok().is_some_and(|s| s.success());
+                let exit_code = status.as_ref().ok().and_then(|s| s.code());
+                let stderr_tail = stderr_buf.lock().await;
+
+                match decide_btw_outcome(got_content, error_msg, exit_code, exit_ok, &stderr_tail) {
+                    BtwOutcome::Complete { exit_code, exit_ok } => {
+                        if !exit_ok {
+                            log::warn!(
+                                "[btw] non-zero exit with content, code={:?}, stderr_tail={}",
+                                exit_code,
+                                truncate_str(&stderr_tail, 200)
+                            );
+                        }
+                        let _ = app_clone.emit(
+                            "btw-complete",
+                            serde_json::json!({ "btw_id": &btw_id_owned }),
+                        );
+                    }
+                    BtwOutcome::Error(err) => {
+                        log::error!("[btw] no content, exit={:?}, error={}", exit_code, err);
+                        let _ = app_clone.emit(
+                            "btw-error",
+                            serde_json::json!({
+                                "btw_id": &btw_id_owned,
+                                "error": err
+                            }),
+                        );
+                    }
+                }
+            }
+            Err(_timeout) => {
+                log::error!(
+                    "[btw] codex side question timed out, btw_id={}",
+                    btw_id_owned
+                );
+                // Explicit kill + wait (child not consumed by timeout future)
+                let mut ch = child.lock().await;
+                let _ = ch.kill().await;
+                let _ = ch.wait().await;
+                let _ = app_clone.emit(
+                    "btw-error",
+                    serde_json::json!({
+                        "btw_id": &btw_id_owned,
+                        "error": "Side question timed out (120s)"
+                    }),
+                );
+            }
+        }
+
+        log::debug!(
+            "[btw] codex side question finished, btw_id={}",
+            btw_id_owned
+        );
+    });
+
+    log::debug!("[btw] spawned codex side question, btw_id={}", btw_id);
+    Ok(btw_id.to_string())
 }
 
 // ── Ralph Loop commands ──
@@ -2671,5 +3350,126 @@ mod tests {
         // 2-element branch uses [0] for opus/sonnet — empty string still produces envs
         // This is existing behavior; the empty-string guard only applies to 3+ elements
         assert_eq!(r.len(), 4);
+    }
+
+    // ── Codex BTW helper tests ──
+
+    #[test]
+    fn btw_extract_agent_message() {
+        let payload = serde_json::json!({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "Hello from btw"}
+        });
+        assert_eq!(
+            extract_codex_btw_text(&payload),
+            Some("Hello from btw".to_string())
+        );
+    }
+
+    #[test]
+    fn btw_extract_skips_command_execution() {
+        let payload = serde_json::json!({
+            "type": "item.completed",
+            "item": {"type": "command_execution", "command": "ls", "aggregated_output": "file.txt"}
+        });
+        assert_eq!(extract_codex_btw_text(&payload), None);
+    }
+
+    #[test]
+    fn btw_extract_agent_message_empty_text() {
+        let payload = serde_json::json!({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": ""}
+        });
+        assert_eq!(extract_codex_btw_text(&payload), None);
+    }
+
+    #[test]
+    fn btw_extract_delta_fallback() {
+        let payload = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "streaming chunk"
+        });
+        assert_eq!(
+            extract_codex_btw_text(&payload),
+            Some("streaming chunk".to_string())
+        );
+    }
+
+    #[test]
+    fn btw_extract_unrelated_event() {
+        let payload = serde_json::json!({"type": "turn.started"});
+        assert_eq!(extract_codex_btw_text(&payload), None);
+    }
+
+    #[test]
+    fn btw_outcome_content_ok() {
+        assert_eq!(
+            decide_btw_outcome(true, None, Some(0), true, ""),
+            BtwOutcome::Complete {
+                exit_code: Some(0),
+                exit_ok: true
+            }
+        );
+    }
+
+    #[test]
+    fn btw_outcome_content_nonzero_exit() {
+        // Got content + non-zero exit → still Complete (warn logged separately)
+        assert_eq!(
+            decide_btw_outcome(true, None, Some(1), false, "some stderr"),
+            BtwOutcome::Complete {
+                exit_code: Some(1),
+                exit_ok: false
+            }
+        );
+    }
+
+    #[test]
+    fn btw_outcome_no_content_error_msg() {
+        assert_eq!(
+            decide_btw_outcome(false, Some("rate limited".into()), Some(1), false, ""),
+            BtwOutcome::Error("rate limited".to_string())
+        );
+    }
+
+    #[test]
+    fn btw_outcome_no_content_no_error_msg_stderr() {
+        let outcome = decide_btw_outcome(false, None, Some(1), false, "oops\npanic");
+        match outcome {
+            BtwOutcome::Error(msg) => assert!(msg.contains("oops")),
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn btw_outcome_no_content_no_error_no_stderr() {
+        let outcome = decide_btw_outcome(false, None, Some(42), false, "");
+        match outcome {
+            BtwOutcome::Error(msg) => assert!(msg.contains("42")),
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn safe_tail_short_string_unchanged() {
+        let mut s = "hello".to_string();
+        safe_tail(&mut s, 10);
+        assert_eq!(s, "hello");
+    }
+
+    #[test]
+    fn safe_tail_truncates_to_char_boundary() {
+        // 3 CJK chars = 9 bytes, each is 1 char
+        let mut s = "你好世界额外文本".to_string(); // 8 chars
+        safe_tail(&mut s, 3);
+        assert_eq!(s, "外文本");
+    }
+
+    #[test]
+    fn safe_tail_multi_byte_emoji() {
+        let mut s = "🎉🎊🎈🎁🎂".to_string(); // 5 chars
+        safe_tail(&mut s, 2);
+        assert_eq!(s, "🎁🎂");
     }
 }

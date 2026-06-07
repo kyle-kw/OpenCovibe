@@ -1,6 +1,7 @@
 import { quoteCliArg, normalizeDirPath, pathsEqual } from "./path-utils";
 import { dbg } from "./debug";
 import { getAgentFeatures } from "./agent-features";
+import { getAgentCaps } from "./agent-caps";
 
 export interface AddDirDeps {
   openDirectoryDialog: (title: string) => Promise<string | null>;
@@ -34,7 +35,13 @@ export async function executeAddDir(ctx: AddDirContext, deps: AddDirDeps): Promi
 
   const dirPath = normalizeDirPath(raw);
 
-  if (ctx.sessionAlive) {
+  // Agents whose CLI honors add-dir live (Claude) push it to the running session;
+  // others (Codex) read writable roots only at thread/start, so we persist to
+  // settings and the dir is picked up on the next spawn / new thread.
+  const liveAddDir = getAgentCaps(ctx.agent).supportsLiveAddDir;
+
+  if (ctx.sessionAlive && liveAddDir) {
+    // Live: send /add-dir to CLI (instant effect)
     const quoted = quoteCliArg(dirPath);
     if (!quoted) {
       deps.appendOutput(deps.t("chat_addDirFailed", { error: deps.t("chat_addDirInvalidPath") }));
@@ -43,13 +50,22 @@ export async function executeAddDir(ctx: AddDirContext, deps: AddDirDeps): Promi
     await deps.sendMessage(`/add-dir ${quoted}`);
     dbg("chat", "add-dir: sent to CLI", { path: dirPath });
   } else {
+    // No live support, or no active session: persist to agent settings
     const settings = await deps.getAgentSettings(ctx.agent);
     const current = (settings.add_dirs ?? []).map(normalizeDirPath);
     if (!current.some((c) => pathsEqual(c, dirPath))) {
       await deps.updateAgentSettings(ctx.agent, {
         add_dirs: [...(settings.add_dirs ?? []), dirPath],
       });
-      deps.appendOutput(deps.t("chat_addDirSaved", { path: dirPath }));
+      // A running session that can't apply add-dir live consumes its writable roots
+      // once at spawn (first turn/start), so a mid-session add only lands on the next
+      // session / new thread — not the current thread's next turn. Pre-session it's a
+      // plain save (picked up when the session next starts).
+      deps.appendOutput(
+        ctx.sessionAlive
+          ? deps.t("chat_addDirNextSession", { path: dirPath })
+          : deps.t("chat_addDirSaved", { path: dirPath }),
+      );
       dbg("chat", "add-dir: saved to settings", { path: dirPath, agent: ctx.agent });
     } else {
       deps.appendOutput(deps.t("chat_addDirDuplicate", { path: dirPath }));
