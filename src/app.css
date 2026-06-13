@@ -641,6 +641,13 @@
   contain-intrinsic-size: auto 300px;
 }
 
+/* WKWebView on macOS can spend excessive CPU re-laying out large chat timelines
+   with content-visibility:auto. Keep the optimization for Chromium/WebView2 only. */
+.ocv-mac .cv-auto {
+  content-visibility: visible;
+  contain-intrinsic-size: auto;
+}
+
 /* Scrollbar-hide utility (for horizontal pill rows) */
 .scrollbar-hide {
   -ms-overflow-style: none;

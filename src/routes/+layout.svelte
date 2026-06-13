@@ -1161,6 +1161,7 @@
   }
 
   async function refreshWindowMaximized() {
+    if (IS_MAC) return;
     try {
       const appWindow = await getTauriWindow();
       if (!appWindow) return;
@@ -1308,6 +1309,7 @@
   // Listen for system preference changes
   onMount(() => {
     isTauriRuntime = isTauriRuntimeAvailable();
+    document.documentElement.classList.toggle("ocv-mac", IS_MAC);
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
     function onSystemChange(e: MediaQueryListEvent) {
       systemDark = e.matches;
@@ -1320,6 +1322,7 @@
     getTauriWindow()
       .then(async (appWindow) => {
         if (!appWindow) return;
+        if (IS_MAC) return;
         await refreshWindowMaximized();
         unlistenResized = await appWindow.onResized(refreshWindowMaximized);
         unlistenMoved = await appWindow.onMoved(refreshWindowMaximized);
