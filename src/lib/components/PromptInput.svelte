@@ -193,9 +193,13 @@
       ? "Ask a side question..."
       : pendingPermission
         ? t("prompt_pendingPermission")
-        : hasRun
-          ? t("prompt_hasRunPlaceholder")
-          : t("prompt_newPlaceholder"),
+        : // Inactive but resumable: tell the user they can just type — the session
+          // auto-recovers on send, no need to click "Resume Session" first. (#115)
+          canResume && !sessionAlive && !running
+          ? t("prompt_continueSessionPlaceholder")
+          : hasRun
+            ? t("prompt_hasRunPlaceholder")
+            : t("prompt_newPlaceholder"),
   );
 
   // ── Git branch (fetched from cwd) ──

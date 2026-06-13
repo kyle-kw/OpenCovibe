@@ -488,6 +488,8 @@
   "prompt_dropFiles": "Drop files here",
   "prompt_hasRunPlaceholder": "Send a message...",
   "prompt_newPlaceholder": "Type a message to start...",
+  "prompt_continueSessionPlaceholder": "Send a message to continue this session...",
+  "chat_restoringSession": "Restoring session…",
   "prompt_removePaste": "Remove pasted text",
   "prompt_editPaste": "Edit pasted text",
   "prompt_editPasteTitle": "Edit paste #{seq}",

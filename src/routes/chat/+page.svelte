@@ -2245,6 +2245,9 @@
           runId: store.run.id,
           sessionId: store.run.session_id,
         });
+        // Make the silent recovery visible so users don't think they must click
+        // "Resume Session" first. (#115)
+        promptRef?.showToast(t("chat_restoringSession"), "info");
         if (slashCmd) {
           processingSlashCmd = slashCmd;
           slashCmdSeenRunning = false;
