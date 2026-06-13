@@ -51,6 +51,7 @@
   import { onMount, setContext, untrack } from "svelte";
   import { dbg, dbgWarn } from "$lib/utils/debug";
   import { fpsCounter } from "$lib/utils/perf";
+  import { IS_MAC } from "$lib/utils/platform";
   import { PLATFORM_PRESETS } from "$lib/utils/platform-presets";
   import { loadAgentSettingsCache } from "$lib/stores/agent-settings-cache.svelte";
   import type { PlatformCredential } from "$lib/types";
@@ -1400,57 +1401,135 @@
 >
   {#if isTauriRuntime}
     <div
-      class="flex h-8 shrink-0 select-none items-center border-b border-border bg-background text-foreground"
+      class="relative flex h-8 shrink-0 select-none items-center border-b border-border bg-background text-foreground"
       onpointerdown={prepareWindowDrag}
       onpointermove={startWindowDrag}
       onpointerup={cancelWindowDrag}
       onpointercancel={cancelWindowDrag}
       ondblclick={handleTitlebarDoubleClick}
     >
-      <div class="flex h-full min-w-0 items-center gap-2 px-3">
-        <img src="/logo.png?v=2" alt="OpenCovibe" class="h-4 w-4 shrink-0 rounded-sm" />
-        <span class="truncate text-xs font-medium">OpenCovibe</span>
-      </div>
-      <div class="h-full flex-1"></div>
-      <div class="flex h-full shrink-0 items-center">
-        <button
-          class="flex h-8 w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          onclick={minimizeWindow}
-          title="Minimize"
-          aria-label="Minimize window"
-        >
-          <svg class="h-3.5 w-3.5" viewBox="0 0 16 16" fill="currentColor">
-            <path d="M3 8h10v1H3z" />
-          </svg>
-        </button>
-        <button
-          class="flex h-8 w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          onclick={toggleMaximizeWindow}
-          title={windowMaximized ? "Restore" : "Maximize"}
-          aria-label={windowMaximized ? "Restore window" : "Maximize window"}
-        >
-          {#if windowMaximized}
-            <svg class="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor">
-              <path d="M5.5 3.5h7v7h-7z" />
-              <path d="M3.5 5.5h2v5h5v2h-7z" />
+      {#if IS_MAC}
+        <div class="flex h-full w-[84px] shrink-0 items-center gap-2 pl-3" data-no-window-drag>
+          <button
+            class="group flex h-3 w-3 items-center justify-center rounded-full bg-[#ff5f57] text-[#7a1f1b] shadow-[inset_0_0_0_0.5px_rgba(0,0,0,0.2)]"
+            onclick={closeWindow}
+            title="Close"
+            aria-label="Close window"
+          >
+            <svg
+              class="h-2 w-2 opacity-0 transition-opacity group-hover:opacity-90"
+              viewBox="0 0 12 12"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+            >
+              <path d="M3.5 3.5l5 5M8.5 3.5l-5 5" />
             </svg>
-          {:else}
-            <svg class="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor">
-              <path d="M4.5 4.5h7v7h-7z" />
+          </button>
+          <button
+            class="group flex h-3 w-3 items-center justify-center rounded-full bg-[#ffbd2e] text-[#7a5200] shadow-[inset_0_0_0_0.5px_rgba(0,0,0,0.18)]"
+            onclick={minimizeWindow}
+            title="Minimize"
+            aria-label="Minimize window"
+          >
+            <svg
+              class="h-2 w-2 opacity-0 transition-opacity group-hover:opacity-90"
+              viewBox="0 0 12 12"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+            >
+              <path d="M3 6h6" />
             </svg>
-          {/if}
-        </button>
-        <button
-          class="flex h-8 w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-red-500 hover:text-white"
-          onclick={closeWindow}
-          title="Close"
-          aria-label="Close window"
-        >
-          <svg class="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor">
-            <path d="M4 4l8 8M12 4l-8 8" />
-          </svg>
-        </button>
-      </div>
+          </button>
+          <button
+            class="group flex h-3 w-3 items-center justify-center rounded-full bg-[#28c840] text-[#0b5f18] shadow-[inset_0_0_0_0.5px_rgba(0,0,0,0.18)]"
+            onclick={toggleMaximizeWindow}
+            title={windowMaximized ? "Restore" : "Maximize"}
+            aria-label={windowMaximized ? "Restore window" : "Maximize window"}
+          >
+            {#if windowMaximized}
+              <svg
+                class="h-2 w-2 opacity-0 transition-opacity group-hover:opacity-90"
+                viewBox="0 0 12 12"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M4 3h5v5" />
+                <path d="M8 3 3 8" />
+              </svg>
+            {:else}
+              <svg
+                class="h-2 w-2 opacity-0 transition-opacity group-hover:opacity-90"
+                viewBox="0 0 12 12"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M8 3H3v5" />
+                <path d="M3 3l6 6" />
+              </svg>
+            {/if}
+          </button>
+        </div>
+        <div class="pointer-events-none absolute left-1/2 flex -translate-x-1/2 items-center gap-2">
+          <img src="/logo.png?v=2" alt="OpenCovibe" class="h-4 w-4 shrink-0 rounded-sm" />
+          <span class="max-w-[40vw] truncate text-xs font-medium">OpenCovibe</span>
+        </div>
+        <div class="h-full flex-1"></div>
+      {:else}
+        <div class="flex h-full min-w-0 items-center gap-2 px-3">
+          <img src="/logo.png?v=2" alt="OpenCovibe" class="h-4 w-4 shrink-0 rounded-sm" />
+          <span class="truncate text-xs font-medium">OpenCovibe</span>
+        </div>
+        <div class="h-full flex-1"></div>
+        <div class="flex h-full shrink-0 items-center">
+          <button
+            class="flex h-8 w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            onclick={minimizeWindow}
+            title="Minimize"
+            aria-label="Minimize window"
+          >
+            <svg class="h-3.5 w-3.5" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M3 8h10v1H3z" />
+            </svg>
+          </button>
+          <button
+            class="flex h-8 w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            onclick={toggleMaximizeWindow}
+            title={windowMaximized ? "Restore" : "Maximize"}
+            aria-label={windowMaximized ? "Restore window" : "Maximize window"}
+          >
+            {#if windowMaximized}
+              <svg class="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor">
+                <path d="M5.5 3.5h7v7h-7z" />
+                <path d="M3.5 5.5h2v5h5v2h-7z" />
+              </svg>
+            {:else}
+              <svg class="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor">
+                <path d="M4.5 4.5h7v7h-7z" />
+              </svg>
+            {/if}
+          </button>
+          <button
+            class="flex h-8 w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-red-500 hover:text-white"
+            onclick={closeWindow}
+            title="Close"
+            aria-label="Close window"
+          >
+            <svg class="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor">
+              <path d="M4 4l8 8M12 4l-8 8" />
+            </svg>
+          </button>
+        </div>
+      {/if}
     </div>
   {/if}
 
